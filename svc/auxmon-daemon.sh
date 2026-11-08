@@ -13,6 +13,7 @@ fi
 mkdir -p /data/dalvik-cache /data/local/tmp /data/local/tmp/hkg_auxmon/sessions 2>/dev/null
 
 SVC_PID_FILE="/data/local/tmp/hkg_auxmon_svc.pid"
+SVC_LOCK_DIR="/data/local/tmp/hkg_auxmon_svc.lock"
 JAVA_PID_FILE="/data/local/tmp/hkg_auxmon_java.pid"
 STOP_FLAG="/data/local/tmp/hkg_auxmon_stopping"
 LOG_FILE="/data/local/tmp/hkg_auxmon.log"
@@ -39,14 +40,26 @@ is_java_pid_alive() {
     return 1
 }
 
+# Acquire atomic directory lock around SVC_PID_FILE check-and-write to prevent race with post.sh / NEMESIS
+lock_acquired=0
+for _lk in 1 2 3 4 5; do
+    if mkdir "$SVC_LOCK_DIR" 2>/dev/null; then
+        lock_acquired=1
+        break
+    fi
+    sleep 1
+done
+
 if [ -f "$SVC_PID_FILE" ]; then
     old_svc_pid="$(cat "$SVC_PID_FILE" 2>/dev/null)"
     if [ -n "$old_svc_pid" ] && [ "$old_svc_pid" != "$$" ] && is_svc_pid_alive "$old_svc_pid"; then
+        [ "$lock_acquired" = "1" ] && rmdir "$SVC_LOCK_DIR" 2>/dev/null
         exit 0
     fi
 fi
 rm -f "$STOP_FLAG" 2>/dev/null
 echo "$$" > "$SVC_PID_FILE" 2>/dev/null
+[ "$lock_acquired" = "1" ] && rmdir "$SVC_LOCK_DIR" 2>/dev/null
 
 log_info() {
     echo "[AuxMon] $*"
@@ -74,7 +87,17 @@ release_power_keep_safely() {
         fi
     done
     kill_mon_java
-    CLASSPATH="$APP_CLASSPATH" /system/bin/app_process /system/bin com.hkg.auxmon.AuxMonMain release-keep >>"$LOG_FILE" 2>&1
+    if ! CLASSPATH="$APP_CLASSPATH" /system/bin/app_process /system/bin com.hkg.auxmon.AuxMonMain release-keep >>"$LOG_FILE" 2>&1; then
+        log_info "release-keep attempt 1 failed; retrying after 1s..."
+        sleep 1
+        if ! CLASSPATH="$APP_CLASSPATH" /system/bin/app_process /system/bin com.hkg.auxmon.AuxMonMain release-keep >>"$LOG_FILE" 2>&1; then
+            log_info "ERROR: release-keep failed after retry!"
+        else
+            log_info "release-keep succeeded on retry."
+        fi
+    else
+        log_info "release-keep succeeded."
+    fi
 }
 
 start_mon_java() {

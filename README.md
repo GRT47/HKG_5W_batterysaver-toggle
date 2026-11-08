@@ -12,14 +12,15 @@
    - 목표 유지 시간으로 **`상시(무제한)` (`target_hours=0`, 기본값)** 및 **`1 / 3 / 6 / 12 / 24 / 48시간`** 프리셋(수동 1~72시간 조절 가능)을 지원합니다.
 
 2. **절전 진입 및 저부하 폴링**
-   - 시동 OFF로 주차 감시가 시작되면 오버레이 패널을 숨기고 `MicomPowerManager.setScreenOn(false)`를 호출해 LCD 화면을 절전 상태로 전환합니다.
+   - `powerStatus == 0 (ACCON)`을 최우선으로 검사하여, 이전 원격/주차 이벤트로 `TeleAcc == 1 (ACCOFF)`이 캐시에 남아 있더라도 주행 중에는 절대 주차로 오판하거나 화면을 끄지 않습니다.
+   - LCD 화면 끄기(`MicomPowerManager.setScreenOn(false)`)는 `powerStatus`가 **`6 (DELAYMODE)` 또는 `7 (PRESYSTEMOFF)`로 확인되었을 때만** 수행하며, `LOGICON(1)`·`ADM(2)`(시동 OFF 상태에서 헤드유닛 사용 중)에서는 전원만 유지하고 화면은 끄지 않습니다.
    - 부팅 시에는 오버레이 패널을 자동으로 띄우지 않으며, 사용자가 패키지 아이콘(`bin/launch.sh`)을 실행하거나 주차 감시 후 재시동했을 때만 패널을 표시합니다.
    - 주차 중 샘플링 및 하드웨어 폴링 주기를 패널에서 **`10s / 30s / 60s` (기본 `30s`)**로 선택할 수 있으며, 불필요한 `getIGN3Status()` 매초 호출을 제거하여 CAN/Binder 부하를 최소화했습니다.
 
 3. **엄격한 12V 보조배터리 방전 보호 (Safety Cutoff) 및 래치 유지**
    - `BCMManager.getBatSoc_M()` 및 `TM_HSCANAdapter.getBatSoc()`에서 유효한 SOC(`1~100%`)를 읽지 못할 경우(`0`, `255`, 또는 `-1`), 임의의 값(`85%`)으로 대체하지 않고 **`-1 (미확인)`**으로 처리합니다.
    - 세션 활성 여부와 무관하게 `PwrKeep`이 켜져 있는 동안 항상 방전 안전 조건을 평가하며, 2분 이상 세션 없이 `PwrKeep`만 켜져 있는 고아 상태도 자동 해제합니다.
-   - 다음 조건 중 하나라도 발생하면 즉시 `requestPwrKeepStop(2)`을 전송(앱이 IG3를 켠 경우에만 IG3 OFF 전송)하고 `confirmPrepareSystemOff()` / `confirmSystemOff()`를 호출해 헤드유닛을 안전하게 종료합니다:
+   - 다음 조건 중 하나라도 발생하면 즉시 `requestPwrKeepStop(2)`을 전송(앱이 IG3를 켠 경우에만 `reqEVIG3Change(false)` 전송)하고 `confirmPrepareSystemOff()` / `confirmSystemOff()`를 호출해 헤드유닛을 안전하게 종료합니다:
      1. **실측 SOC 하한**: `socPct < 55%`
      2. **BCM 배터리 상태 플래그 이상**: `BCMVehicleStatusListener.onBatSocStatus_M(1 /* UNNORMAL */)`
      3. **ICU 전원 자동 차단 사전 경보**: `BCMManager.getBattAutoCutPreWrng() == 1` (`onChangedBattAutoCutPreWrng(1)`)
@@ -27,19 +28,19 @@
      5. **Micom 방전 경보**: `MicomPowerStatusListener.onDischargeAlert()` / `onLogicOnDischargeAlert()`
      6. **실측 전압 하한**: 직접 측정된 전압(`SYSFS_ADC` / `SYS_PROP`)이 `11.55V` 미만일 때
      7. **SOC 미확인 시간 한도**: 주차 중 SOC 미확인(`-1`) 상태가 **30분 이상** 지속될 때
-   - 수동 중지 및 안전 차단 상태는 `power_latch.txt`에 영구 저장되어 데몬 재시작 시에도 풀리지 않으며, 다음 `ACCON`(시동 ON) 또는 사용자의 수동 시작 시에만 해제됩니다.
-   - 데몬 중지(`on_stop`) 또는 패키지 제거(`scripts/preun.sh`) 시 래퍼 재시작을 먼저 차단한 뒤 `Looper.prepareMainLooper()`가 준비된 `AuxMonMain release-keep` 원샷을 실행하여 `PwrKeep(2)` 해제를 보장합니다.
+   - 주차 중 수동 중지 및 안전 차단 상태는 `power_latch.txt`에 영구 저장되어 데몬 재시작 시에도 풀리지 않으며(주행 중 테스트 세션을 수동 중지한 경우에는 `auto_keep=0`을 저장하지 않음), 다음 `ACCON`(시동 ON) 또는 사용자의 수동 시작 시에만 해제됩니다.
+   - 데몬 중지(`on_stop`) 또는 패키지 제거(`scripts/preun.sh`) 시 래퍼 재시작을 먼저 차단한 뒤 리스너 등록 없이 `Looper.prepareMainLooper()`가 준비된 `AuxMonMain release-keep` 원샷을 실행(실패 시 1회 재시도 및 `logcat` 기록)하여 `PwrKeep(2)` 해제를 보장합니다.
 
 4. **정직한 차량 텔레메트리 수집 및 충전 횟수 감지**
    - **사용 API**:
      - `MicomPowerManager`: `getPowerStatus()`, `requestPwrKeepStart(2)`, `requestPwrKeepStop(2)`, `confirmPrepareSystemOff()`, `confirmSystemOff()`, `setScreenOn(boolean)`
      - `BCMManager`: `getIGNStatus()`, `getBatSoc_M()`, `getBatSocSegment()`, `getBatEvtAlramState()`, `getBattAutoCutPreWrng()`, `getBattMngAlert()` (`1=HAZARDON 비상등`, `2=TAILON 미등`)
-     - `HEVManager`: `getLastIGN3Status()`, `getIGN3Status()`, `reqEVIG3Change(boolean)`, `onEVIG3Changed(boolean)`
+     - `HEVManager`: `getLastIGN3Status()`, `getIGN3Status()`, `reqEVIG3Change(boolean)`, `onEVIG3Changed(boolean)`, `onEVIG3Responded(boolean)`
      - `DATCManager`: `isIGN3Status()`
-     - `TM_HSCANAdapter`: `getBatSoc()`, `getIG3RlyMode()`, `sendIG3RlyMode(byte)`, `get_BAT_AuxBattOpt()`
+     - `TM_HSCANAdapter`: `getBatSoc()`, `getIG3RlyMode()`(원시값 로깅 전용), `get_BAT_AuxBattOpt()` (순정 TMU 원격 공조·충전 신호와 충돌하는 `sendIG3RlyMode` 호출 제거)
    - **전압 표시 및 충전 판정**:
      - 12V 직접 전압 센서가 없는 환경에서는 SOC 기반 추정 전압임을 화면과 로그에 **`SOC_EST(추정)` / `IG3_EST(추정)`**으로 명시하며, 추정 전압은 충전 여부 판정이나 전압 안전 차단에 사용하지 않습니다.
-     - `ig3RlyMode == 1 (MONITORING)`은 대기 상태로 취급하며, 실제 충전(`ig3On == true` 또는 `ig3RlyMode >= 2` 또는 실측 전압 `>= 13.55V`)만 충전 횟수로 집계합니다.
+     - VCU `getIG3RlyMode()`는 평상시에도 `2` 등을 반환할 수 있으므로 원시값만 CSV/JSON에 기록하며, 실제 충전 판정은 권위 있는 `ig3On == true` (`HEVManager` / `DATCManager`) 또는 실측 전압 상승(`>= 13.55V`)만을 기준으로 충전 횟수를 집계합니다.
      - 수동 IG3 테스트 시 가짜 상태값 강제 주입을 제거하여 실제 차량의 IG3 응답 여부를 그대로 확인할 수 있습니다.
      - 모든 경과 시간 및 스케줄러 주기는 `SystemClock.elapsedRealtime()` 단조 시계를 기준으로 계산합니다.
 

@@ -18,7 +18,7 @@ import java.lang.reflect.Method;
  *   - com.hkmc.bcm.BCMManager              (12V Battery SOC %, IGN status, Discharge/AutoCut/Light alerts)
  *   - com.hkmc.hev.HEVManager              (IG3 status, reqEVIG3Change(boolean))
  *   - com.hkmc.datc.DATCManager            (isIGN3Status())
- *   - com.hkmc.telematics.hscan.tm_interface.TM_HSCANAdapter (getBatSoc, getIG3RlyMode, sendIG3RlyMode(byte))
+ *   - com.hkmc.telematics.hscan.tm_interface.TM_HSCANAdapter (getBatSoc, getIG3RlyMode read-only)
  */
 public final class HkmcVehicleBridge {
 
@@ -153,6 +153,15 @@ public final class HkmcVehicleBridge {
     }
 
     public static synchronized boolean initBridge(Object contextObj) {
+        return initBridge(contextObj, true);
+    }
+
+    /**
+     * Initializes HKMC service managers.
+     * When registerListeners is false (e.g., release-keep one-shot mode), skips registering
+     * MicomPowerStatusListener, SystemOffResponder, HEVListener, and BCM listeners.
+     */
+    public static synchronized boolean initBridge(Object contextObj, boolean registerListeners) {
         loadPowerLatchState();
         try {
             if (contextObj != null) {
@@ -229,7 +238,7 @@ public final class HkmcVehicleBridge {
                 }
             }
 
-            if (!listenersRegistered) {
+            if (registerListeners && !listenersRegistered) {
                 try {
                     ListenerRegistrar.registerAll(micomPowerMgr, bcmMgr, hevMgr);
                     listenersRegistered = true;
@@ -269,25 +278,32 @@ public final class HkmcVehicleBridge {
         if (pwrSt < 0) {
             pwrSt = 0;
         }
+        // ACCON (0) is checked FIRST and clears any stale TeleAcc ACCOFF(1) left from earlier remote/parking
+        if (pwrSt == 0 && cachedTeleAccStatus == 1) {
+            cachedTeleAccStatus = -1;
+        }
         snap.powerStatus = pwrSt;
         snap.teleAccStatus = cachedTeleAccStatus;
 
-        // Micom powerStatus: 0=ACCON, 1=LOGICON, 2=ADM, 5=SYSTEMREADY, 6=DELAYMODE, 7=PRESYSTEMOFF, 255=OFF
-        boolean nonDrivingMicom = (cachedTeleAccStatus == 1)
-                || (pwrSt == 1 || pwrSt == 2 || pwrSt == 6 || pwrSt == 7 || pwrSt == 255);
-
+        // Micom powerStatus: 0=ACCON (always driving), 1=LOGICON, 2=ADM, 5=SYSTEMREADY, 6=DELAYMODE, 7=PRESYSTEMOFF, 255=OFF
         boolean ign = false;
         boolean acc = false;
-        if (!nonDrivingMicom) {
-            ign = (pwrSt == 0);
-            acc = (pwrSt == 0 || cachedTeleAccStatus == 2);
-            if (bcmMgr != null) {
-                try {
-                    Object ignVal = bcmMgr.getClass().getMethod("getIGNStatus").invoke(bcmMgr);
-                    if (ignVal instanceof Boolean) {
-                        ign = ((Boolean) ignVal).booleanValue();
+        if (pwrSt == 0) {
+            ign = true;
+            acc = true;
+        } else {
+            boolean nonDrivingMicom = (pwrSt == 1 || pwrSt == 2 || pwrSt == 6 || pwrSt == 7 || pwrSt == 255)
+                    || (cachedTeleAccStatus == 1);
+            if (!nonDrivingMicom) {
+                acc = (cachedTeleAccStatus == 2);
+                if (bcmMgr != null) {
+                    try {
+                        Object ignVal = bcmMgr.getClass().getMethod("getIGNStatus").invoke(bcmMgr);
+                        if (ignVal instanceof Boolean) {
+                            ign = ((Boolean) ignVal).booleanValue();
+                        }
+                    } catch (Throwable ignored) {
                     }
-                } catch (Throwable ignored) {
                 }
             }
         }
@@ -415,7 +431,7 @@ public final class HkmcVehicleBridge {
         }
 
         if (directVolts < 8.0f) {
-            if (snap.ig3On || snap.ig3RlyMode >= 2) {
+            if (snap.ig3On) {
                 voltSrc = "IG3_EST(추정)";
             } else if (finalSoc > 0 && finalSoc <= 100) {
                 voltSrc = "SOC_EST(추정)";
@@ -570,14 +586,32 @@ public final class HkmcVehicleBridge {
 
     /**
      * Requests LCD screen off when entering headless parking keep-alive, or restores screen when driving.
-     * Uses MicomPowerManager.setScreenOn(boolean).
+     * Turning the screen OFF (sleep=true) is strictly permitted ONLY when Micom powerStatus is
+     * confirmed to be 6 (DELAYMODE) or 7 (PRESYSTEMOFF). Never turns off the screen in
+     * 0 (ACCON), 1 (LOGICON), or 2 (ADM).
      */
-    public static synchronized void setScreenSleepMode(boolean sleep) {
-        if (micomPowerMgr == null) return;
+    public static synchronized boolean setScreenSleepMode(boolean sleep) {
+        if (micomPowerMgr == null) return false;
+        if (sleep) {
+            int pwrSt = cachedPowerStatus;
+            try {
+                Object val = micomPowerMgr.getClass().getMethod("getPowerStatus").invoke(micomPowerMgr);
+                if (val instanceof Integer) {
+                    pwrSt = ((Integer) val).intValue();
+                    cachedPowerStatus = pwrSt;
+                }
+            } catch (Throwable ignored) {
+            }
+            if (pwrSt != 6 && pwrSt != 7) {
+                return false;
+            }
+        }
         try {
             micomPowerMgr.getClass().getMethod("setScreenOn", boolean.class)
                     .invoke(micomPowerMgr, Boolean.valueOf(!sleep));
+            return true;
         } catch (Throwable ignored) {
+            return false;
         }
     }
 
@@ -596,13 +630,13 @@ public final class HkmcVehicleBridge {
     }
 
     /**
-     * Sends IG3 OFF (reqEVIG3Change(false) & sendIG3RlyMode((byte) 0)) ONLY if our app
-     * previously requested IG3 ON (scheduled 1h mode or manual IG3 test), so we never
-     * interrupt the vehicle's own OEM Aux. Battery Saver+ charging or driving IG3 state.
+     * Sends IG3 OFF (reqEVIG3Change(false)) ONLY if our app previously requested IG3 ON
+     * (scheduled 1h mode or manual IG3 test), so we never interrupt the vehicle's own
+     * OEM Aux. Battery Saver+ charging or driving IG3 state.
      */
     public static synchronized boolean stopIg3IfRequestedByUs() {
         File flagFile = new File(IG3_REQ_FLAG_PATH);
-        if (!weRequestedIg3On && ! manualIg3TestActive && !flagFile.isFile()) {
+        if (!weRequestedIg3On && !manualIg3TestActive && !flagFile.isFile()) {
             return false;
         }
         return triggerIg3Charging(false, false);
@@ -633,8 +667,9 @@ public final class HkmcVehicleBridge {
     }
 
     /**
-     * Requests turning IG3 (12V Aux Battery Saver+ / LDC Charging) ON or OFF.
-     * Uses TM_HSCANAdapter.sendIG3RlyMode(byte) per firmware signature (B)V.
+     * Requests turning IG3 (12V Aux Battery Saver+ / LDC Charging) ON or OFF via HEVManager.reqEVIG3Change(boolean).
+     * Does NOT invoke TM_HSCANAdapter.sendIG3RlyMode(byte) so we never spoof or overwrite OEM TMU
+     * remote charging/climate control requests (TMU1_CF_TMU_IG3RLY).
      */
     public static synchronized boolean triggerIg3Charging(boolean enable, boolean isManualTest) {
         manualIg3TestActive = isManualTest && enable;
@@ -667,17 +702,6 @@ public final class HkmcVehicleBridge {
             }
         }
 
-        if (hscanAdapter != null) {
-            try {
-                byte mode = (byte) (enable ? 1 : 0);
-                hscanAdapter.getClass().getMethod("sendIG3RlyMode", byte.class).invoke(hscanAdapter, Byte.valueOf(mode));
-                invokedAny = true;
-                System.out.println("[AuxMon] TM_HSCANAdapter.sendIG3RlyMode((byte)" + mode + ") invoked");
-            } catch (Throwable t) {
-                System.out.println("[AuxMon] sendIG3RlyMode error: " + t);
-            }
-        }
-
         return invokedAny;
     }
 
@@ -694,7 +718,8 @@ public final class HkmcVehicleBridge {
                         public void onPowerStatusChanged(int status) {
                             cachedPowerStatus = status;
                             if (status == 0) {
-                                // ACCON: vehicle is running again -> clear safety cutoff & re-enable auto keep
+                                // ACCON: vehicle is running again -> clear stale TeleAcc cache, safety cutoff & re-enable auto keep
+                                cachedTeleAccStatus = -1;
                                 resetSafetyCutoff();
                             } else if ((status == 1 || status == 2 || status == 6 || status == 7)
                                     && autoKeepOnShutdownEnabled && !safetyCutoffTripped) {
@@ -711,8 +736,8 @@ public final class HkmcVehicleBridge {
                             if (status == 2) {
                                 // TeleAcc ACCON -> clear safety cutoff & re-enable auto keep
                                 resetSafetyCutoff();
-                            } else if (status == 1 && autoKeepOnShutdownEnabled && !safetyCutoffTripped) {
-                                // TeleAcc ACCOFF: immediately assert PwrKeep(2) before Micom starts shutdown
+                            } else if (status == 1 && cachedPowerStatus != 0 && autoKeepOnShutdownEnabled && !safetyCutoffTripped) {
+                                // TeleAcc ACCOFF (when not in ACCON): immediately assert PwrKeep(2) before Micom starts shutdown
                                 sendPwrKeepStartImmediate("onTeleAccStatusChanged:ACCOFF");
                                 notifyAccOffIntercepted("TELE_ACC_OFF");
                             }

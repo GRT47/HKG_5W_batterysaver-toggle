@@ -36,8 +36,20 @@ fi
 pkill -f "com.hkg.auxmon.AuxMonMain daemon" >/dev/null 2>&1
 
 # 4. Run release-keep one-shot (prepares Looper & verifies MicomPowerManager.requestPwrKeepStop(2))
-CLASSPATH="$APP_CLASSPATH" /system/bin/app_process /system/bin com.hkg.auxmon.AuxMonMain release-keep >>/data/local/tmp/hkg_auxmon.log 2>&1
+#    Check exit code; retry once if the first attempt fails, and record via logcat.
+if ! CLASSPATH="$APP_CLASSPATH" /system/bin/app_process /system/bin com.hkg.auxmon.AuxMonMain release-keep >>/data/local/tmp/hkg_auxmon.log 2>&1; then
+    log -t HKGAuxMon "preun.sh: release-keep attempt 1 failed; retrying after 1s..." 2>/dev/null
+    sleep 1
+    if ! CLASSPATH="$APP_CLASSPATH" /system/bin/app_process /system/bin com.hkg.auxmon.AuxMonMain release-keep >>/data/local/tmp/hkg_auxmon.log 2>&1; then
+        log -t HKGAuxMon "preun.sh: ERROR: release-keep failed after retry!" 2>/dev/null
+    else
+        log -t HKGAuxMon "preun.sh: release-keep succeeded on retry." 2>/dev/null
+    fi
+else
+    log -t HKGAuxMon "preun.sh: release-keep succeeded." 2>/dev/null
+fi
 
+rm -rf /data/local/tmp/hkg_auxmon_svc.lock 2>/dev/null
 rm -f /data/local/tmp/hkg_auxmon_svc.pid \
       /data/local/tmp/hkg_auxmon_java.pid \
       /data/local/tmp/hkg_auxmon_cmd \

@@ -83,18 +83,32 @@ public final class AuxMonModels {
 
         /**
          * Determines whether the vehicle is currently in ACC/IGN ON (driving/accessory) state.
-         * Micom powerStatus (LOGICON=1, ADM=2, DELAYMODE=6, PRESYSTEMOFF=7, OFF=255) and
-         * TeleAcc ACCOFF(1) are authoritative and always mean NOT driving, even if BCM
-         * getIGNStatus() remains cached true after CAN sleep.
+         * 1. powerStatus == 0 (ACCON) is checked FIRST and ALWAYS means driving, even if
+         *    a stale teleAccStatus == 1 (ACCOFF) remains cached from an earlier remote event.
+         * 2. Explicit non-driving Micom states (LOGICON=1, ADM=2, DELAYMODE=6, PRESYSTEMOFF=7, OFF=255)
+         *    or teleAccStatus == 1 (when powerStatus != 0) mean NOT driving, even if BCM
+         *    getIGNStatus() remains cached true after CAN sleep.
          */
         public boolean isDrivingState() {
-            if (teleAccStatus == 1) {
-                return false;
+            if (powerStatus == 0) {
+                return true;
             }
             if (powerStatus == 1 || powerStatus == 2 || powerStatus == 6 || powerStatus == 7 || powerStatus == 255) {
                 return false;
             }
-            return powerStatus == 0 || ignOn || accOn;
+            if (teleAccStatus == 1) {
+                return false;
+            }
+            return ignOn || accOn;
+        }
+
+        /**
+         * Returns true only when Micom powerStatus is in shutdown phase (DELAYMODE=6 or PRESYSTEMOFF=7),
+         * where turning off the LCD screen for headless parking keep-alive is safe.
+         * LOGICON(1) and ADM(2) keep the screen ON because the user may be operating the headunit with IGN OFF.
+         */
+        public boolean isShutdownPowerState() {
+            return powerStatus == 6 || powerStatus == 7;
         }
 
         public boolean isDirectVoltageMeasured() {
@@ -109,12 +123,12 @@ public final class AuxMonModels {
 
         /**
          * Determines whether 12V auxiliary battery charging (IG3 / LDC) is currently active.
-         * Does NOT use estimated voltage (SOC_EST) to avoid circular logic, and treats
-         * ig3RlyMode == 1 (MONITORING standby) as non-charging.
+         * Uses authoritative HEV/DATC ig3On status or direct measured voltage rise (>= 13.55V).
+         * Does NOT use getIG3RlyMode() (VCU10_CF_Vcu_IG3RlyMd) directly for charging detection
+         * because VCU reports values such as 2 in normal non-charging states.
          */
         public boolean isChargingActive() {
             if (ig3On) return true;
-            if (ig3RlyMode >= 2) return true;
             if (!ignOn && !accOn && isDirectVoltageMeasured() && voltageV >= 13.55f) return true;
             return false;
         }
@@ -345,8 +359,6 @@ public final class AuxMonModels {
                         ev.triggerReason = chargeTriggerHint;
                     } else if (snap.ig3On) {
                         ev.triggerReason = "IG3_AUX_SAVER";
-                    } else if (snap.ig3RlyMode >= 2) {
-                        ev.triggerReason = "VCU_IG3_RLY_" + snap.ig3RlyMode;
                     } else {
                         ev.triggerReason = "MEASURED_VOLTAGE_RISE";
                     }
@@ -475,7 +487,7 @@ public final class AuxMonModels {
         if (directVolts >= 8.0f && directVolts <= 16.5f) {
             return Math.round(directVolts * 100.0f) / 100.0f;
         }
-        if (ig3On || ig3RlyMode >= 2) {
+        if (ig3On) {
             int refSoc = (socPct > 0 && socPct <= 100) ? socPct : 80;
             float boost = 14.32f + Math.min(0.15f, (refSoc * 0.0012f));
             return Math.round(boost * 100.0f) / 100.0f;
