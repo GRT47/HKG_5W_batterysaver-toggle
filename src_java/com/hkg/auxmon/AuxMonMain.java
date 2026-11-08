@@ -16,19 +16,20 @@ import java.util.Locale;
  * HKG Standard Gen5W (Android 4.4.2, API 19) 12V Auxiliary Battery Parking Power-Keep &
  * Auto-Charging (Aux. Battery Saver+ / IG3) Monitor Daemon.
  *
- * Key architecture (per firmware review):
- *   1. Event-driven immediate PwrKeepStart(2) on ACCOFF / LOGICON / DELAYMODE / PRESYSTEMOFF / onPrepareSystemOff,
- *      with 60-second heartbeat re-transmission to survive OEM app mode-2 stop collisions.
- *   2. Supports "상시(무제한)" (targetHours = 0) as well as 1h..72h parking duration presets,
- *      and configurable 10s / 30s / 60s parking sampling intervals.
- *   3. Strict safety cutoff: never fabricates 85% SOC when SOC is unknown (-1); releases PwrKeep
- *      and confirms system off if SOC < 55%, BatSocStatus_M == UNNORMAL(1), AutoCutPreWrng == 1,
- *      BatEvtAlarm > 0, or if SOC remains unknown for > 30 minutes during parking.
- *   4. Uses monotonic clock (SystemClock.elapsedRealtime()) for all elapsed/scheduler timings.
+ * Key architecture (per 1st & 2nd firmware reviews):
+ *   1. Event-driven immediate PwrKeepStart(2) on ACCOFF / LOGICON / ADM / DELAYMODE / PRESYSTEMOFF /
+ *      onPrepareSystemOff, with 60-second heartbeat re-transmission.
+ *   2. Micom powerStatus & TeleAcc are authoritative for driving vs parking state (ignoring stale
+ *      BCM getIGNStatus() when CAN sleeps).
+ *   3. Safety evaluation runs whenever keepAliveActive is true (even if no session is active),
+ *      with a 2-minute orphan PwrKeep watchdog and persistent power_latch.txt across restarts.
+ *   4. Conditional IG3 OFF: only sends reqEVIG3Change(false) / sendIG3RlyMode((byte)0) if our app
+ *      actually requested IG3 ON, never interrupting OEM Aux. Battery Saver+ or driving IG3.
+ *   5. Verified release-keep one-shot with prepared Looper and non-zero exit code on failure.
  */
 public class AuxMonMain {
 
-    public static final String VERSION = "1.1.0";
+    public static final String VERSION = "1.2.0";
     private static final String CMD_FILE_PATH = "/data/local/tmp/hkg_auxmon_cmd";
     private static final String STATE_JSON_PATH = "/data/local/tmp/hkg_auxmon_state.json";
     private static final String CONFIG_FILE_PATH = "/data/local/tmp/hkg_auxmon/config.txt";
@@ -36,11 +37,12 @@ public class AuxMonMain {
 
     public static final int SAFETY_MIN_SOC_PCT = 55;
     public static final float SAFETY_MIN_DIRECT_VOLT = 11.55f;
-    public static final long UNKNOWN_SOC_MAX_PARKING_SEC = 1800L; // Max 30 min keep-alive if SOC is unknown (-1)
-    private static final long PWR_KEEP_HEARTBEAT_MS = 60000L;     // Re-send requestPwrKeepStart(2) every 60s
-    private static final long SAVE_INTERVAL_MS = 30000L;          // Persist session to disk every 30s
-    private static final long ACTIVE_IG3_PERIOD_SEC = 3600L;      // 1 hour period for active IG3 mode
-    private static final long ACTIVE_IG3_DURATION_SEC = 1200L;    // 20 min charging duration per active cycle
+    public static final long UNKNOWN_SOC_MAX_PARKING_SEC = 1800L;  // Max 30 min keep-alive if SOC is unknown (-1)
+    private static final long ORPHAN_PWR_KEEP_TIMEOUT_MS = 120000L; // Max 2 min PwrKeep without an active session
+    private static final long PWR_KEEP_HEARTBEAT_MS = 60000L;      // Re-send requestPwrKeepStart(2) every 60s
+    private static final long SAVE_INTERVAL_MS = 30000L;           // Persist session to disk every 30s
+    private static final long ACTIVE_IG3_PERIOD_SEC = 3600L;       // 1 hour period for active IG3 mode
+    private static final long ACTIVE_IG3_DURATION_SEC = 1200L;     // 20 min charging duration per active cycle
 
     private static final Object STATE_LOCK = new Object();
     private static final List<ParkingSession> sessionHistory = new ArrayList<ParkingSession>();
@@ -82,17 +84,26 @@ public class AuxMonMain {
     }
 
     /**
-     * One-shot release invoked by auxmon-daemon.sh on_stop and scripts/preun.sh
-     * to guarantee Micom PwrKeep(2) and IG3 are turned OFF when the daemon stops or is uninstalled.
+     * One-shot release invoked by auxmon-daemon.sh on_stop and scripts/preun.sh.
+     * Prepares Looper on the main thread before initializing ActivityThread/MicomPowerManager,
+     * and exits with code 1 if MicomPowerManager could not be reached or requestPwrKeepStop(2) failed.
      */
     private static void runReleaseKeepOneShot() {
         try {
             System.out.println("[AuxMon] Executing release-keep one-shot...");
-            HkmcVehicleBridge.initBridge(null);
-            HkmcVehicleBridge.releaseAllPowerAndIg3(true, true);
-            System.out.println("[AuxMon] release-keep completed.");
+            HkmcVehicleBridge.ensureThreadLooperPrepared();
+            boolean bridgeOk = HkmcVehicleBridge.initBridge(null);
+            boolean stopOk = HkmcVehicleBridge.releaseAllPowerAndIg3(true, true);
+            if (bridgeOk && stopOk) {
+                System.out.println("[AuxMon] release-keep succeeded (MicomPowerManager.requestPwrKeepStop(2) invoked).");
+                System.exit(0);
+            } else {
+                System.err.println("[AuxMon] release-keep FAILED (bridgeOk=" + bridgeOk + ", stopOk=" + stopOk + ").");
+                System.exit(1);
+            }
         } catch (Throwable t) {
-            System.out.println("[AuxMon] release-keep error: " + t);
+            System.err.println("[AuxMon] release-keep exception: " + t);
+            System.exit(1);
         }
     }
 
@@ -128,7 +139,15 @@ public class AuxMonMain {
             handleCommandFile(cmdFile);
         }
 
-        boolean wasDriving = true;
+        // Determine initial driving state taking persistent safety/manual-stop latch into account
+        LiveTelemetrySnapshot initSnap = HkmcVehicleBridge.pollSnapshot();
+        latestLiveSnapshot = initSnap;
+        if (initSnap.isSocValid()) {
+            lastValidSocRealtimeMs = initSnap.elapsedRealtimeMs;
+        }
+        boolean latchedOff = HkmcVehicleBridge.isSafetyCutoffTripped() || !HkmcVehicleBridge.isAutoKeepOnShutdownEnabled();
+        boolean wasDriving = latchedOff ? initSnap.isDrivingState() : true;
+
         long lastPollRt = 0L;
         long lastSampleRt = 0L;
         long lastDiskSaveRt = 0L;
@@ -146,6 +165,7 @@ public class AuxMonMain {
                 long nowEpochMs = System.currentTimeMillis();
 
                 boolean monitoringParking = isCurrentlyMonitoringParking();
+                boolean keepAliveNow = HkmcVehicleBridge.isKeepAliveActive();
                 boolean overlayShown = AuxMonOverlay.isOverlayVisible();
                 long pollIntervalMs = (wasDriving || overlayShown)
                         ? 2000L
@@ -176,8 +196,12 @@ public class AuxMonMain {
                 accOffInterceptedFlag = false;
 
                 synchronized (STATE_LOCK) {
-                    if ((wasDriving && !isDrivingNow) || (intercepted && !isDrivingNow && !isCurrentlyMonitoringParking())) {
-                        // Driving just ended -> Start parking session (PwrKeepStart(2) already sent by callback or sent now)
+                    boolean canAutoStartKeep = HkmcVehicleBridge.isAutoKeepOnShutdownEnabled()
+                            && !HkmcVehicleBridge.isSafetyCutoffTripped();
+
+                    if (((wasDriving && !isDrivingNow) || (intercepted && !isDrivingNow))
+                            && canAutoStartKeep && !isCurrentlyMonitoringParking()) {
+                        // Driving just ended -> Start parking session
                         String targetLbl = AuxMonModels.formatTargetHoursLabel(configuredTargetHours);
                         System.out.println("[AuxMon] Detected Driving -> Parking transition. Starting session (" + targetLbl + ").");
                         startNewParkingSessionLocked(
@@ -187,9 +211,8 @@ public class AuxMonMain {
                                 true);
                         lastSampleRt = nowRt;
                     } else if (!wasDriving && isDrivingNow) {
-                        // Vehicle started driving again -> Finalize ongoing parking session & restore screen
+                        // Vehicle started driving again -> Clear latches, finalize ongoing parking session & restore screen
                         HkmcVehicleBridge.resetSafetyCutoff();
-                        HkmcVehicleBridge.setAutoKeepOnShutdownEnabled(true);
                         HkmcVehicleBridge.setScreenSleepMode(false);
                         if (activeParkingSession != null && activeParkingSession.status == AuxMonModels.SESSION_MONITORING_PARKING) {
                             activeParkingSession.closeOngoingChargeIfAny(nowEpochMs);
@@ -258,6 +281,29 @@ public class AuxMonMain {
                         }
                     } else {
                         wakePollRequested = false;
+                        // Even when no session is active, if PwrKeep is active, ALWAYS enforce safety evaluation & orphan watchdog!
+                        if (HkmcVehicleBridge.isKeepAliveActive()) {
+                            long keepStartRt = HkmcVehicleBridge.getPwrKeepActivatedRealtimeMs();
+                            if (keepStartRt <= 0L) keepStartRt = nowRt;
+                            String safetyViolation = evaluateSafetyCutoffReason(snap, nowRt, keepStartRt);
+                            if (safetyViolation != null) {
+                                handleSafetyDischargeCutoff(safetyViolation);
+                            } else if (!isDrivingNow && canAutoStartKeep) {
+                                // PwrKeep was asserted by listener callback; immediately bind it to a parking session
+                                String targetLbl = AuxMonModels.formatTargetHoursLabel(configuredTargetHours);
+                                startNewParkingSessionLocked(
+                                        nowEpochMs,
+                                        nowRt,
+                                        "전원 유지(PwrKeep) 콜백 연동: " + targetLbl + " 주차 기록을 시작합니다.",
+                                        true);
+                                lastSampleRt = nowRt;
+                            } else if (nowRt - keepStartRt >= ORPHAN_PWR_KEEP_TIMEOUT_MS) {
+                                // Watchdog: PwrKeep active > 2 minutes without an active monitoring session -> release!
+                                System.out.println("[AuxMon] Orphan PwrKeep watchdog triggered (>2m without session); releasing PwrKeep.");
+                                stopAllIg3Charging();
+                                HkmcVehicleBridge.setParkingPowerKeep(false, true);
+                            }
+                        }
                     }
                 }
 
@@ -333,20 +379,17 @@ public class AuxMonMain {
     private static void stopScheduledIg3IfActive() {
         if (scheduledIg3Running) {
             scheduledIg3Running = false;
-            HkmcVehicleBridge.triggerIg3Charging(false, false);
+            HkmcVehicleBridge.stopIg3IfRequestedByUs();
         }
     }
 
     /**
-     * Ensures both scheduled IG3 and manual IG3 test are turned OFF when a session ends or safety cutoff trips.
+     * Stops IG3 charging ONLY if our app requested IG3 ON (scheduled 1h mode or manual IG3 test).
+     * Never sends IG3 OFF if the vehicle itself initiated OEM Aux. Battery Saver+ or driving IG3.
      */
     private static void stopAllIg3Charging() {
         scheduledIg3Running = false;
-        if (HkmcVehicleBridge.isManualIg3TestActive()) {
-            HkmcVehicleBridge.triggerIg3Charging(false, false);
-        } else {
-            HkmcVehicleBridge.triggerIg3Charging(false, false);
-        }
+        HkmcVehicleBridge.stopIg3IfRequestedByUs();
     }
 
     private static void handleSafetyDischargeCutoff(String reason) {
@@ -359,7 +402,7 @@ public class AuxMonMain {
                 activeParkingSession.pwrKeepActive = false;
                 saveSessionQuietly(activeParkingSession);
             }
-            setStatusBanner("⚠ 보조배터리 방전 보호 안전 차단 발동 (" + reason + ") — PwrKeep 및 IG3를 해제하고 종료를 승인했습니다.", 0xFFEF4444);
+            setStatusBanner("⚠ 보조배터리 방전 보호 안전 차단 발동 (" + reason + ") — PwrKeep을 해제하고 종료를 승인했습니다.", 0xFFEF4444);
             System.out.println("[AuxMon] Safety discharge cutoff triggered: " + reason);
             AuxMonOverlay.requestRefresh();
         }
@@ -402,6 +445,7 @@ public class AuxMonMain {
         } else if ("start_parking".equals(cmd)) {
             AuxMonOverlay.showOverlay();
             synchronized (STATE_LOCK) {
+                HkmcVehicleBridge.resetSafetyCutoff();
                 startNewParkingSessionLocked(
                         System.currentTimeMillis(),
                         AuxMonModels.elapsedRealtimeMs(),
@@ -427,7 +471,6 @@ public class AuxMonMain {
     }
 
     private static void startNewParkingSessionLocked(long nowEpochMs, long nowRt, String bannerMsg, boolean enterHeadlessSleep) {
-        // Finalize any previous MONITORING session so it never stays as an orphan
         if (activeParkingSession != null && activeParkingSession.status == AuxMonModels.SESSION_MONITORING_PARKING) {
             activeParkingSession.closeOngoingChargeIfAny(nowEpochMs);
             activeParkingSession.status = AuxMonModels.SESSION_COMPLETED_N_HOURS;
@@ -475,6 +518,7 @@ public class AuxMonMain {
             if (activeParkingSession != null && activeParkingSession.status == AuxMonModels.SESSION_MONITORING_PARKING) {
                 stopActiveParkingSessionManual();
             } else {
+                HkmcVehicleBridge.resetSafetyCutoff();
                 startNewParkingSessionLocked(
                         System.currentTimeMillis(),
                         AuxMonModels.elapsedRealtimeMs(),
@@ -484,20 +528,27 @@ public class AuxMonMain {
         }
     }
 
+    /**
+     * Stops the active parking session manually AND disables autoKeepOnShutdownEnabled
+     * (persisted to power_latch.txt) + confirms system off so the headunit can actually go to sleep.
+     */
     public static void stopActiveParkingSessionManual() {
         synchronized (STATE_LOCK) {
+            stopAllIg3Charging();
+            HkmcVehicleBridge.setAutoKeepOnShutdownEnabled(false);
+            HkmcVehicleBridge.setParkingPowerKeep(false, true);
             if (activeParkingSession != null && activeParkingSession.status == AuxMonModels.SESSION_MONITORING_PARKING) {
                 long nowMs = System.currentTimeMillis();
                 activeParkingSession.closeOngoingChargeIfAny(nowMs);
                 activeParkingSession.status = AuxMonModels.SESSION_COMPLETED_N_HOURS;
                 activeParkingSession.pwrKeepActive = false;
-                stopAllIg3Charging();
-                HkmcVehicleBridge.setParkingPowerKeep(false, false);
                 saveSessionQuietly(activeParkingSession);
                 setStatusBanner(
-                        "■ 주차 기록을 종료하고 PwrKeep을 해제했습니다 (세션 " + activeParkingSession.sessionId
+                        "■ 주차 기록을 수동 종료하고 PwrKeep을 해제했습니다 (세션 " + activeParkingSession.sessionId
                                 + ", 총 충전 " + activeParkingSession.getChargeCount() + "회).",
                         0xFFFBBF24);
+            } else {
+                setStatusBanner("■ 전원 유지(PwrKeep)를 해제했습니다 (다음 시동 ON 시 자동 복귀).", 0xFFFBBF24);
             }
         }
     }
@@ -511,6 +562,7 @@ public class AuxMonMain {
             LiveTelemetrySnapshot snap = HkmcVehicleBridge.pollSnapshot();
             latestLiveSnapshot = snap;
             if (activeParkingSession == null || activeParkingSession.status != AuxMonModels.SESSION_MONITORING_PARKING) {
+                HkmcVehicleBridge.resetSafetyCutoff();
                 startNewParkingSessionLocked(
                         System.currentTimeMillis(),
                         AuxMonModels.elapsedRealtimeMs(),
@@ -523,7 +575,7 @@ public class AuxMonMain {
         }
 
         if (nextState) {
-            setStatusBanner("⚡ [IG3 수동충전 요청 ON] reqEVIG3Change(true) + sendIG3RlyMode(1) 전송! 차량의 실제 IG3 응답(ON/OFF)을 확인하세요.", 0xFF10B981);
+            setStatusBanner("⚡ [IG3 수동충전 요청 ON] reqEVIG3Change(true) + sendIG3RlyMode((byte)1) 전송! 차량의 실제 IG3 응답을 확인하세요.", 0xFF10B981);
         } else {
             setStatusBanner("⚡ [IG3 수동충전 요청 OFF] 수동 IG3 충전 요청을 해제했습니다.", 0xFF38BDF8);
         }
@@ -554,7 +606,6 @@ public class AuxMonMain {
                     target = getDisplayedSession();
                     allCopy = new ArrayList<ParkingSession>(sessionHistory);
                 }
-                // Do NOT fabricate a demo session if no sessions exist!
                 ExportResult res = AuxMonModels.exportSessionToUsb(target, allCopy, null);
                 setStatusBanner(res.message, res.success ? 0xFF10B981 : 0xFFEF4444);
                 AuxMonOverlay.requestRefresh();
@@ -580,7 +631,6 @@ public class AuxMonMain {
     }
 
     public static void cyclePresetParkingHours() {
-        // Presets include 0 (상시 무제한) as well as 1, 3, 6, 12, 24, 48 hours
         int[] presets = new int[]{0, 1, 3, 6, 12, 24, 48};
         synchronized (STATE_LOCK) {
             int next = 0;
@@ -723,6 +773,7 @@ public class AuxMonMain {
     // ========================================================================
 
     private static void loadConfigFromDisk() {
+        HkmcVehicleBridge.loadPowerLatchState();
         try {
             File f = new File(CONFIG_FILE_PATH);
             if (!f.isFile()) return;
@@ -788,6 +839,8 @@ public class AuxMonMain {
             sb.append("  \"sample_interval_sec\": ").append(configuredSampleIntervalSec).append(",\n");
             sb.append("  \"auto_charge_mode\": ").append(configuredAutoChargeMode).append(",\n");
             sb.append("  \"pwr_keep_active\": ").append(HkmcVehicleBridge.isKeepAliveActive()).append(",\n");
+            sb.append("  \"auto_keep_enabled\": ").append(HkmcVehicleBridge.isAutoKeepOnShutdownEnabled()).append(",\n");
+            sb.append("  \"safety_cutoff_tripped\": ").append(HkmcVehicleBridge.isSafetyCutoffTripped()).append(",\n");
             sb.append("  \"live_voltage_v\": ").append(AuxMonModels.formatFloat2(live != null ? live.voltageV : 0f)).append(",\n");
             sb.append("  \"live_voltage_source\": \"").append(live != null ? live.voltageSource : "UNKNOWN").append("\",\n");
             sb.append("  \"live_soc_pct\": ").append(live != null ? live.socPct : -1).append(",\n");
@@ -832,44 +885,56 @@ public class AuxMonMain {
 
     private static void runSelfTests() {
         try {
-            // 1. Test 12V Voltage Synthesis & Unknown SOC Handling
+            // 1. Test 12V Voltage Synthesis & Unknown SOC (-1 and 0) Handling
             float vRest80 = AuxMonModels.synthesize12vVoltage(0.0f, 80, false, 0);
             assertTrue(vRest80 >= 12.50f && vRest80 <= 12.65f, "80% resting voltage in 12.50~12.65V: " + vRest80);
 
             float vChg80 = AuxMonModels.synthesize12vVoltage(0.0f, 80, true, 2);
             assertTrue(vChg80 >= 14.30f && vChg80 <= 14.50f, "IG3 charging voltage in 14.30~14.50V: " + vChg80);
 
-            float vUnknown = AuxMonModels.synthesize12vVoltage(0.0f, -1, false, 0);
-            assertEq(Float.valueOf(0.0f), Float.valueOf(vUnknown), "unknown SOC (-1) with IG3 OFF returns 0.0V (not fake 85%)");
+            float vUnknownNeg = AuxMonModels.synthesize12vVoltage(0.0f, -1, false, 0);
+            assertEq(Float.valueOf(0.0f), Float.valueOf(vUnknownNeg), "unknown SOC (-1) with IG3 OFF returns 0.0V");
+
+            float vUnknownZero = AuxMonModels.synthesize12vVoltage(0.0f, 0, false, 0);
+            assertEq(Float.valueOf(0.0f), Float.valueOf(vUnknownZero), "uninitialized SOC (0) with IG3 OFF returns 0.0V");
 
             float vDirect = AuxMonModels.synthesize12vVoltage(12.42f, -1, false, 0);
             assertEq(Float.valueOf(12.42f), Float.valueOf(vDirect), "direct CAN voltage pass-through");
 
-            // 2. Test Driving vs Parking Detection & Charging Detection (no circular logic, ig3RlyMode=1 is standby)
-            LiveTelemetrySnapshot snapStandby = new LiveTelemetrySnapshot();
-            snapStandby.powerStatus = 1; // LOGICON
-            snapStandby.teleAccStatus = 1; // ACCOFF
-            snapStandby.ignOn = false;
-            snapStandby.accOn = false;
-            snapStandby.ig3On = false;
-            snapStandby.ig3RlyMode = 1; // MONITORING standby
-            snapStandby.socPct = 82;
-            snapStandby.voltageV = 14.40f;
-            snapStandby.voltageSource = "SOC_EST(추정)";
-            assertTrue(!snapStandby.isDrivingState(), "LOGICON + ACCOFF is NOT driving");
-            assertTrue(!snapStandby.isChargingActive(), "ig3RlyMode=1 (MONITORING) and SOC_EST voltage must NOT trigger charging");
+            // 2. Test Micom-Authoritative Driving vs Parking (stale BCM ignOn=true in DELAYMODE must be NOT driving)
+            LiveTelemetrySnapshot snapDelayStaleIgn = new LiveTelemetrySnapshot();
+            snapDelayStaleIgn.powerStatus = 6; // DELAYMODE
+            snapDelayStaleIgn.teleAccStatus = 1; // ACCOFF
+            snapDelayStaleIgn.ignOn = true; // Even if BCM IGN were stale true
+            snapDelayStaleIgn.accOn = true;
+            snapDelayStaleIgn.ig3On = false;
+            snapDelayStaleIgn.ig3RlyMode = 1; // MONITORING standby
+            snapDelayStaleIgn.socPct = 82;
+            snapDelayStaleIgn.voltageV = 14.40f;
+            snapDelayStaleIgn.voltageSource = "SOC_EST(추정)";
+            assertTrue(!snapDelayStaleIgn.isDrivingState(), "DELAYMODE(6) must be NOT driving even if ignOn is true");
+            assertTrue(!snapDelayStaleIgn.isChargingActive(), "ig3RlyMode=1 (MONITORING) and SOC_EST voltage must NOT trigger charging");
 
-            // 3. Test Safety Cutoff Rules (Low SOC, BatSocStatus_M UNNORMAL, Unknown SOC timeout)
+            LiveTelemetrySnapshot snapLogicon = new LiveTelemetrySnapshot();
+            snapLogicon.powerStatus = 1; // LOGICON
+            snapLogicon.ignOn = true;
+            assertTrue(!snapLogicon.isDrivingState(), "LOGICON(1) must be NOT driving");
+
+            // 3. Test Safety Cutoff Rules & Conditional IG3 OFF
             LiveTelemetrySnapshot snapUnnormal = new LiveTelemetrySnapshot();
             snapUnnormal.socPct = 80;
             snapUnnormal.batSocStatusFlag = 1; // UNNORMAL
             assertTrue(evaluateSafetyCutoffReason(snapUnnormal, 10000L, 0L) != null, "BatSocStatus_M=1 triggers safety cutoff");
 
-            LiveTelemetrySnapshot snapUnknownSoc = new LiveTelemetrySnapshot();
-            snapUnknownSoc.socPct = -1; // Unknown SOC
+            LiveTelemetrySnapshot snapZeroSoc = new LiveTelemetrySnapshot();
+            snapZeroSoc.socPct = 0; // 0 is treated as unknown, not 0% immediate cutoff
             lastValidSocRealtimeMs = 0L;
-            assertEq(null, evaluateSafetyCutoffReason(snapUnknownSoc, 600000L, 0L), "Unknown SOC at 10m within grace window");
-            assertTrue(evaluateSafetyCutoffReason(snapUnknownSoc, 1900000L, 0L) != null, "Unknown SOC > 30m triggers safety cutoff");
+            assertEq(null, evaluateSafetyCutoffReason(snapZeroSoc, 600000L, 0L), "SOC=0 treated as unknown within 30m grace window");
+            assertTrue(evaluateSafetyCutoffReason(snapZeroSoc, 1900000L, 0L) != null, "SOC=0 > 30m triggers unknown SOC timeout cutoff");
+
+            // Conditional IG3 OFF: when we never requested IG3 ON, stopIg3IfRequestedByUs() returns false
+            assertTrue(!HkmcVehicleBridge.didWeRequestIg3On(), "initially we did not request IG3 ON");
+            assertTrue(!HkmcVehicleBridge.stopIg3IfRequestedByUs(), "stopIg3IfRequestedByUs is no-op when we didn't request IG3");
 
             // 4. Test Parking Session Recording, Serialization, Orphan Cleanup & USB Export
             ParkingSession demo = AuxMonModels.createDemoParkingSession(6, "DE22EV (tcc897x / Android 4.4.2)");
@@ -889,7 +954,6 @@ public class AuxMonMain {
             File tmpUsb = new File(System.getProperty("java.io.tmpdir"), "hkg_auxmon_usb_test_" + System.nanoTime());
             tmpUsb.mkdirs();
             try {
-                // Verify empty export refuses without fabricating fake demo data
                 ExportResult emptyRes = AuxMonModels.exportSessionToUsb(null, new ArrayList<ParkingSession>(), tmpUsb);
                 assertTrue(!emptyRes.success, "empty export must not fabricate demo data");
 

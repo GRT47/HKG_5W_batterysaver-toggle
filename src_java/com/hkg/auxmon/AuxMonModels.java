@@ -83,16 +83,18 @@ public final class AuxMonModels {
 
         /**
          * Determines whether the vehicle is currently in ACC/IGN ON (driving/accessory) state.
-         * LOGICON(1), ADM(2), DELAYMODE(6), PRESYSTEMOFF(7), and TeleAcc ACCOFF(1) are NOT driving states.
+         * Micom powerStatus (LOGICON=1, ADM=2, DELAYMODE=6, PRESYSTEMOFF=7, OFF=255) and
+         * TeleAcc ACCOFF(1) are authoritative and always mean NOT driving, even if BCM
+         * getIGNStatus() remains cached true after CAN sleep.
          */
         public boolean isDrivingState() {
             if (teleAccStatus == 1) {
                 return false;
             }
             if (powerStatus == 1 || powerStatus == 2 || powerStatus == 6 || powerStatus == 7 || powerStatus == 255) {
-                return ignOn;
+                return false;
             }
-            return ignOn || accOn || powerStatus == 0;
+            return powerStatus == 0 || ignOn || accOn;
         }
 
         public boolean isDirectVoltageMeasured() {
@@ -102,7 +104,7 @@ public final class AuxMonModels {
         }
 
         public boolean isSocValid() {
-            return socPct >= 0 && socPct <= 100;
+            return socPct > 0 && socPct <= 100;
         }
 
         /**
@@ -474,11 +476,11 @@ public final class AuxMonModels {
             return Math.round(directVolts * 100.0f) / 100.0f;
         }
         if (ig3On || ig3RlyMode >= 2) {
-            int refSoc = (socPct >= 0 && socPct <= 100) ? socPct : 80;
+            int refSoc = (socPct > 0 && socPct <= 100) ? socPct : 80;
             float boost = 14.32f + Math.min(0.15f, (refSoc * 0.0012f));
             return Math.round(boost * 100.0f) / 100.0f;
         }
-        if (socPct < 0 || socPct > 100) {
+        if (socPct <= 0 || socPct > 100) {
             return 0.0f;
         }
         float baseV = 11.50f + (socPct * 0.0132f);
@@ -1081,7 +1083,7 @@ public final class AuxMonModels {
     }
 
     public static String formatSocPct(int socPct) {
-        if (socPct < 0 || socPct > 100) {
+        if (socPct <= 0 || socPct > 100) {
             return "미확인(--)";
         }
         return socPct + "%";

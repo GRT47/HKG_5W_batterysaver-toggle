@@ -3,7 +3,7 @@ export PATH=/data/nemesis/bin:/sbin:/vendor/bin:/system/sbin:/system/bin:/system
 export LD_LIBRARY_PATH=/vendor/lib:/system/lib
 export ANDROID_ROOT=/system
 export ANDROID_DATA=/data
-# Do NOT override BOOTCLASSPATH so system .odex dependency tables (e.g. com.infobank.odex) remain valid.
+# Do NOT override BOOTCLASSPATH so system .odex dependency tables remain valid.
 
 if [ -d "/data/nemesis/apps/hkg.auxmon" ]; then
     INSTALL_DIR="/data/nemesis/apps/hkg.auxmon"
@@ -14,6 +14,7 @@ mkdir -p /data/dalvik-cache /data/local/tmp /data/local/tmp/hkg_auxmon/sessions 
 
 SVC_PID_FILE="/data/local/tmp/hkg_auxmon_svc.pid"
 JAVA_PID_FILE="/data/local/tmp/hkg_auxmon_java.pid"
+STOP_FLAG="/data/local/tmp/hkg_auxmon_stopping"
 LOG_FILE="/data/local/tmp/hkg_auxmon.log"
 APP_CLASSPATH="$INSTALL_DIR/bin/auxmon.jar:/system/framework/com.hkmc.ext.hcan.jar"
 MON_PID=""
@@ -44,18 +45,12 @@ if [ -f "$SVC_PID_FILE" ]; then
         exit 0
     fi
 fi
+rm -f "$STOP_FLAG" 2>/dev/null
 echo "$$" > "$SVC_PID_FILE" 2>/dev/null
 
 log_info() {
     echo "[AuxMon] $*"
     log -t HKGAuxMon "$*" 2>/dev/null
-}
-
-release_power_keep_safely() {
-    log_info "Releasing Micom PwrKeep & IG3 before daemon exit..."
-    echo "release" > /data/local/tmp/hkg_auxmon_cmd 2>/dev/null
-    sleep 1
-    CLASSPATH="$APP_CLASSPATH" /system/bin/app_process /system/bin com.hkg.auxmon.AuxMonMain release-keep >>"$LOG_FILE" 2>&1
 }
 
 kill_mon_java() {
@@ -67,7 +62,23 @@ kill_mon_java() {
     pkill -f "com.hkg.auxmon.AuxMonMain daemon" >/dev/null 2>&1
 }
 
+release_power_keep_safely() {
+    log_info "Releasing Micom PwrKeep & IG3 before daemon exit..."
+    echo "1" > "$STOP_FLAG" 2>/dev/null
+    echo "release" > /data/local/tmp/hkg_auxmon_cmd 2>/dev/null
+    for _w in 1 2; do
+        if [ -n "$MON_PID" ] && kill -0 "$MON_PID" 2>/dev/null; then
+            sleep 1
+        else
+            break
+        fi
+    done
+    kill_mon_java
+    CLASSPATH="$APP_CLASSPATH" /system/bin/app_process /system/bin com.hkg.auxmon.AuxMonMain release-keep >>"$LOG_FILE" 2>&1
+}
+
 start_mon_java() {
+    [ -f "$STOP_FLAG" ] && return 0
     if is_java_pid_alive "$MON_PID"; then
         return 0
     fi
@@ -88,8 +99,7 @@ start_mon_java() {
 on_stop() {
     log_info "Service stopping via signal; releasing PwrKeep & IG3..."
     release_power_keep_safely
-    rm -f "$SVC_PID_FILE" "$JAVA_PID_FILE" 2>/dev/null
-    kill_mon_java
+    rm -f "$SVC_PID_FILE" "$JAVA_PID_FILE" "$STOP_FLAG" 2>/dev/null
     exit 0
 }
 trap 'on_stop' TERM INT
@@ -107,6 +117,9 @@ wait $!
 start_mon_java
 
 while true; do
+    if [ -f "$STOP_FLAG" ]; then
+        exit 0
+    fi
     if ! is_java_pid_alive "$MON_PID"; then
         start_mon_java
     fi

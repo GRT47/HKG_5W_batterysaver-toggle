@@ -14,11 +14,11 @@ import java.lang.reflect.Method;
  * Hardware & Framework Bridge for Hyundai/Kia Standard Gen5W Headunit (Android 4.4.2).
  *
  * Interfaces with:
- *   - com.hkmc.power.MicomPowerManager     (Power status, PwrKeepStart(2)/Stop(2), SystemOffResponder, Screen/Display off)
- *   - com.hkmc.bcm.BCMManager              (12V Battery SOC %, IGN/AccInputCheck status, Discharge/AutoCut alerts)
+ *   - com.hkmc.power.MicomPowerManager     (Power status, PwrKeepStart(2)/Stop(2), SystemOffResponder, setScreenOn)
+ *   - com.hkmc.bcm.BCMManager              (12V Battery SOC %, IGN status, Discharge/AutoCut/Light alerts)
  *   - com.hkmc.hev.HEVManager              (IG3 status, reqEVIG3Change(boolean))
  *   - com.hkmc.datc.DATCManager            (isIGN3Status())
- *   - com.hkmc.telematics.hscan.tm_interface.TM_HSCANAdapter (getBatSoc, getIG3RlyMode, sendIG3RlyMode)
+ *   - com.hkmc.telematics.hscan.tm_interface.TM_HSCANAdapter (getBatSoc, getIG3RlyMode, sendIG3RlyMode(byte))
  */
 public final class HkmcVehicleBridge {
 
@@ -27,6 +27,9 @@ public final class HkmcVehicleBridge {
         void onAccOffShutdownIntercepted(String triggerSource);
         void onDischargeDanger(String reason);
     }
+
+    private static final String POWER_LATCH_FILE_PATH = "/data/local/tmp/hkg_auxmon/power_latch.txt";
+    private static final String IG3_REQ_FLAG_PATH = "/data/local/tmp/hkg_auxmon/ig3_requested.flag";
 
     private static volatile Object sysContext = null;
     private static volatile Object micomPowerMgr = null;
@@ -40,17 +43,19 @@ public final class HkmcVehicleBridge {
     private static volatile boolean autoKeepOnShutdownEnabled = true;
     private static volatile boolean safetyCutoffTripped = false;
     private static volatile boolean keepAliveActive = false;
+    private static volatile long pwrKeepActivatedRealtimeMs = 0L;
     private static volatile long lastPwrKeepSentRealtimeMs = 0L;
+    private static volatile boolean weRequestedIg3On = false;
     private static volatile EventCallback eventCallback = null;
 
     // Cached asynchronous values from HKMC listeners
     private static volatile int cachedPowerStatus = -1;
-    private static volatile int cachedTeleAccStatus = -1; // 2=ACCON, 1=ACCOFF, 255=INVALID
+    private static volatile int cachedTeleAccStatus = -1;   // 2=ACCON, 1=ACCOFF, 255=INVALID
     private static volatile Boolean cachedIg3Status = null;
-    private static volatile int cachedSocM = -1;          // 0..100 valid, -1 unknown
+    private static volatile int cachedSocM = -1;            // 1..100 valid, -1 unknown
     private static volatile int cachedBatSocStatusFlag = 0; // BatSocStatus_M: 0=NORMAL, 1=UNNORMAL
     private static volatile int cachedBatEvtAlarm = 0;
-    private static volatile int cachedBattMngAlert = 0;  // 1=HAZARDON, 2=TAILON
+    private static volatile int cachedBattMngAlert = 0;     // 1=HAZARDON, 2=TAILON
     private static volatile int cachedAutoCutPreWrng = 0;
     private static volatile boolean manualIg3TestActive = false;
 
@@ -65,32 +70,96 @@ public final class HkmcVehicleBridge {
         return keepAliveActive;
     }
 
+    public static long getPwrKeepActivatedRealtimeMs() {
+        return pwrKeepActivatedRealtimeMs;
+    }
+
     public static boolean isAutoKeepOnShutdownEnabled() {
         return autoKeepOnShutdownEnabled;
     }
 
-    public static void setAutoKeepOnShutdownEnabled(boolean enabled) {
+    public static synchronized void setAutoKeepOnShutdownEnabled(boolean enabled) {
         autoKeepOnShutdownEnabled = enabled;
+        savePowerLatchState();
     }
 
     public static boolean isSafetyCutoffTripped() {
         return safetyCutoffTripped;
     }
 
-    public static void resetSafetyCutoff() {
+    public static synchronized void resetSafetyCutoff() {
         safetyCutoffTripped = false;
+        autoKeepOnShutdownEnabled = true;
+        savePowerLatchState();
     }
 
     public static boolean isManualIg3TestActive() {
         return manualIg3TestActive;
     }
 
+    public static boolean didWeRequestIg3On() {
+        return weRequestedIg3On || new File(IG3_REQ_FLAG_PATH).isFile();
+    }
+
+    public static synchronized void loadPowerLatchState() {
+        try {
+            File f = new File(POWER_LATCH_FILE_PATH);
+            if (!f.isFile()) return;
+            String txt = AuxMonModels.readFileText(f);
+            String[] lines = txt.split("\n");
+            for (int i = 0; i < lines.length; i++) {
+                String line = lines[i].trim();
+                if (line.startsWith("safety_cutoff=")) {
+                    safetyCutoffTripped = "1".equals(line.substring(14).trim());
+                } else if (line.startsWith("auto_keep=")) {
+                    autoKeepOnShutdownEnabled = !"0".equals(line.substring(10).trim());
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static synchronized void savePowerLatchState() {
+        try {
+            File f = new File(POWER_LATCH_FILE_PATH);
+            File parent = f.getParentFile();
+            if (parent != null && !parent.exists()) {
+                parent.mkdirs();
+            }
+            String content = "safety_cutoff=" + (safetyCutoffTripped ? "1" : "0")
+                    + "\nauto_keep=" + (autoKeepOnShutdownEnabled ? "1" : "0") + "\n";
+            AuxMonModels.writeBytesAtomic(f, content.getBytes(AuxMonModels.UTF8));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * Ensures the calling thread has a prepared Android Looper before invoking ActivityThread.systemMain(),
+     * preventing "Can't create handler inside thread that has not called Looper.prepare()" in one-shot CLI mode.
+     */
+    public static void ensureThreadLooperPrepared() {
+        try {
+            Class<?> looperCls = Class.forName("android.os.Looper");
+            Object cur = looperCls.getMethod("myLooper").invoke(null);
+            if (cur == null) {
+                try {
+                    looperCls.getMethod("prepareMainLooper").invoke(null);
+                } catch (Throwable ignored) {
+                    looperCls.getMethod("prepare").invoke(null);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static synchronized boolean initBridge(Object contextObj) {
+        loadPowerLatchState();
         try {
             if (contextObj != null) {
                 sysContext = contextObj;
             }
             if (sysContext == null) {
+                ensureThreadLooperPrepared();
                 Class<?> atCls = Class.forName("android.app.ActivityThread");
                 Object at = null;
                 try {
@@ -168,7 +237,7 @@ public final class HkmcVehicleBridge {
                     System.out.println("[AuxMon] ListenerRegistrar note: " + t);
                 }
             }
-            return true;
+            return micomPowerMgr != null;
         } catch (Throwable t) {
             return false;
         }
@@ -185,7 +254,7 @@ public final class HkmcVehicleBridge {
         snap.timestampMs = System.currentTimeMillis();
         snap.elapsedRealtimeMs = AuxMonModels.elapsedRealtimeMs();
 
-        // 1. Power Status & ACC/IGN
+        // 1. Power Status & ACC/IGN (Micom powerStatus & TeleAcc are authoritative)
         int pwrSt = cachedPowerStatus;
         if (micomPowerMgr != null) {
             try {
@@ -203,44 +272,29 @@ public final class HkmcVehicleBridge {
         snap.powerStatus = pwrSt;
         snap.teleAccStatus = cachedTeleAccStatus;
 
-        // Only ACCON(0) is considered active ACC/IGN by default; LOGICON(1), ADM(2), DELAYMODE(6), PRESYSTEMOFF(7) are not.
-        boolean ign = (pwrSt == 0 && cachedTeleAccStatus != 1);
-        boolean acc = (pwrSt == 0 && cachedTeleAccStatus != 1);
-        if (cachedTeleAccStatus == 2) {
-            acc = true;
-        } else if (cachedTeleAccStatus == 1) {
-            acc = false;
-            ign = false;
-        }
+        // Micom powerStatus: 0=ACCON, 1=LOGICON, 2=ADM, 5=SYSTEMREADY, 6=DELAYMODE, 7=PRESYSTEMOFF, 255=OFF
+        boolean nonDrivingMicom = (cachedTeleAccStatus == 1)
+                || (pwrSt == 1 || pwrSt == 2 || pwrSt == 6 || pwrSt == 7 || pwrSt == 255);
 
-        if (bcmMgr != null) {
-            try {
-                Object ignVal = bcmMgr.getClass().getMethod("getIGNStatus").invoke(bcmMgr);
-                if (ignVal instanceof Boolean) {
-                    ign = ((Boolean) ignVal).booleanValue();
+        boolean ign = false;
+        boolean acc = false;
+        if (!nonDrivingMicom) {
+            ign = (pwrSt == 0);
+            acc = (pwrSt == 0 || cachedTeleAccStatus == 2);
+            if (bcmMgr != null) {
+                try {
+                    Object ignVal = bcmMgr.getClass().getMethod("getIGNStatus").invoke(bcmMgr);
+                    if (ignVal instanceof Boolean) {
+                        ign = ((Boolean) ignVal).booleanValue();
+                    }
+                } catch (Throwable ignored) {
                 }
-            } catch (Throwable ignored) {
             }
-            try {
-                // Firmware has getAccInputCheck() (NOT getACCStatus())
-                Object accVal = bcmMgr.getClass().getMethod("getAccInputCheck").invoke(bcmMgr);
-                if (accVal instanceof Boolean) {
-                    acc = ((Boolean) accVal).booleanValue();
-                } else if (accVal instanceof Number) {
-                    acc = (((Number) accVal).intValue() == 1);
-                }
-            } catch (Throwable ignored) {
-            }
-        }
-        if (cachedTeleAccStatus == 1 || pwrSt == 6 || pwrSt == 7 || pwrSt == 255) {
-            acc = false;
-            ign = false;
         }
         snap.ignOn = ign;
         snap.accOn = acc;
 
         // 2. IG3 (Aux. Battery Saver+ / LDC 12V Charging Rail) Status
-        // Read cached/service state via getLastIGN3Status() & isIGN3Status() without spamming getIGN3Status() every second
         boolean ig3 = (cachedIg3Status != null) ? cachedIg3Status.booleanValue() : false;
         if (hevMgr != null) {
             try {
@@ -277,7 +331,8 @@ public final class HkmcVehicleBridge {
                 Object v = hscanAdapter.getClass().getMethod("getBatSoc").invoke(hscanAdapter);
                 if (v instanceof Number) {
                     int hs = ((Number) v).intValue();
-                    if (hs >= 0 && hs <= 100) {
+                    // Treat 0 as uninitialized/unknown; valid SOC is 1..100
+                    if (hs > 0 && hs <= 100) {
                         hscanSoc = hs;
                     }
                 }
@@ -304,8 +359,8 @@ public final class HkmcVehicleBridge {
                 Object v = bcmMgr.getClass().getMethod("getBatSoc_M").invoke(bcmMgr);
                 if (v instanceof Number) {
                     int val = ((Number) v).intValue();
-                    // getBatSoc_M() returns 0..100 when valid, 255 or -1 when invalid
-                    if (val >= 0 && val <= 100) {
+                    // Treat 0, 255, and -1 as unknown; valid SOC is 1..100
+                    if (val > 0 && val <= 100) {
                         bcmSoc = val;
                         cachedSocM = val;
                     }
@@ -334,8 +389,8 @@ public final class HkmcVehicleBridge {
             }
         }
 
-        // NEVER substitute 85% when SOC is unknown! Keep -1 so safety logic knows whether SOC is valid.
-        int finalSoc = (bcmSoc >= 0 && bcmSoc <= 100) ? bcmSoc : ((hscanSoc >= 0 && hscanSoc <= 100) ? hscanSoc : -1);
+        // Keep -1 when SOC is unknown (never substitute 85% or 0%)
+        int finalSoc = (bcmSoc > 0 && bcmSoc <= 100) ? bcmSoc : ((hscanSoc > 0 && hscanSoc <= 100) ? hscanSoc : -1);
         snap.socPct = finalSoc;
         snap.batSocStatusFlag = cachedBatSocStatusFlag;
         snap.socSegment = socSeg;
@@ -362,7 +417,7 @@ public final class HkmcVehicleBridge {
         if (directVolts < 8.0f) {
             if (snap.ig3On || snap.ig3RlyMode >= 2) {
                 voltSrc = "IG3_EST(추정)";
-            } else if (finalSoc >= 0 && finalSoc <= 100) {
+            } else if (finalSoc > 0 && finalSoc <= 100) {
                 voltSrc = "SOC_EST(추정)";
             } else {
                 voltSrc = "UNKNOWN";
@@ -425,8 +480,12 @@ public final class HkmcVehicleBridge {
         if (safetyCutoffTripped || !autoKeepOnShutdownEnabled) {
             return;
         }
+        long nowRt = AuxMonModels.elapsedRealtimeMs();
+        if (!keepAliveActive || pwrKeepActivatedRealtimeMs <= 0L) {
+            pwrKeepActivatedRealtimeMs = nowRt;
+        }
         keepAliveActive = true;
-        lastPwrKeepSentRealtimeMs = AuxMonModels.elapsedRealtimeMs();
+        lastPwrKeepSentRealtimeMs = nowRt;
         if (micomPowerMgr != null) {
             try {
                 micomPowerMgr.getClass().getMethod("requestPwrKeepStart", int.class).invoke(micomPowerMgr, Integer.valueOf(2));
@@ -461,21 +520,34 @@ public final class HkmcVehicleBridge {
 
     /**
      * Enables or disables headless power keep-alive during parking.
-     * Uses MicomPowerManager.requestPwrKeepStart(2) + PowerManager PARTIAL_WAKE_LOCK.
+     * Uses MicomPowerManager.requestPwrKeepStart(2)/requestPwrKeepStop(2) + PARTIAL_WAKE_LOCK.
+     * Returns true if the MicomPowerManager call succeeded.
      */
-    public static synchronized void setParkingPowerKeep(boolean enable, boolean confirmShutdownWhenStopping) {
-        keepAliveActive = enable;
+    public static synchronized boolean setParkingPowerKeep(boolean enable, boolean confirmShutdownWhenStopping) {
+        long nowRt = AuxMonModels.elapsedRealtimeMs();
         if (enable) {
+            if (!keepAliveActive || pwrKeepActivatedRealtimeMs <= 0L) {
+                pwrKeepActivatedRealtimeMs = nowRt;
+            }
+            keepAliveActive = true;
             safetyCutoffTripped = false;
-            lastPwrKeepSentRealtimeMs = AuxMonModels.elapsedRealtimeMs();
+            lastPwrKeepSentRealtimeMs = nowRt;
+            savePowerLatchState();
+        } else {
+            keepAliveActive = false;
+            pwrKeepActivatedRealtimeMs = 0L;
         }
+
+        boolean micomOk = false;
         if (micomPowerMgr != null) {
             try {
                 if (enable) {
                     micomPowerMgr.getClass().getMethod("requestPwrKeepStart", int.class).invoke(micomPowerMgr, Integer.valueOf(2));
+                    micomOk = true;
                     System.out.println("[AuxMon] MicomPowerManager.requestPwrKeepStart(2) invoked (keep-alive ON)");
                 } else {
                     micomPowerMgr.getClass().getMethod("requestPwrKeepStop", int.class).invoke(micomPowerMgr, Integer.valueOf(2));
+                    micomOk = true;
                     System.out.println("[AuxMon] MicomPowerManager.requestPwrKeepStop(2) invoked (keep-alive OFF)");
                     if (confirmShutdownWhenStopping) {
                         try {
@@ -493,18 +565,15 @@ public final class HkmcVehicleBridge {
             }
         }
         manageWakeLock(enable);
+        return micomOk;
     }
 
     /**
-     * Requests screen/display off when entering headless parking keep-alive, or restores screen when driving.
+     * Requests LCD screen off when entering headless parking keep-alive, or restores screen when driving.
+     * Uses MicomPowerManager.setScreenOn(boolean).
      */
     public static synchronized void setScreenSleepMode(boolean sleep) {
         if (micomPowerMgr == null) return;
-        try {
-            micomPowerMgr.getClass().getMethod("setDisplayOffMode", boolean.class)
-                    .invoke(micomPowerMgr, Boolean.valueOf(sleep));
-        } catch (Throwable ignored) {
-        }
         try {
             micomPowerMgr.getClass().getMethod("setScreenOn", boolean.class)
                     .invoke(micomPowerMgr, Boolean.valueOf(!sleep));
@@ -513,16 +582,30 @@ public final class HkmcVehicleBridge {
     }
 
     /**
-     * Safely releases all PwrKeep, manual/scheduled IG3 charging, and WakeLocks.
-     * Invoked on safety cutoff, daemon stop, and package uninstall (release-keep).
+     * Safely releases PwrKeep, stops IG3 ONLY if our app requested IG3 ON, and releases WakeLocks.
+     * Returns true if MicomPowerManager.requestPwrKeepStop(2) was actually invoked.
      */
-    public static synchronized void releaseAllPowerAndIg3(boolean markSafetyCutoff, boolean confirmShutdown) {
+    public static synchronized boolean releaseAllPowerAndIg3(boolean markSafetyCutoff, boolean confirmShutdown) {
         if (markSafetyCutoff) {
             safetyCutoffTripped = true;
         }
         autoKeepOnShutdownEnabled = false;
-        triggerIg3Charging(false, false);
-        setParkingPowerKeep(false, confirmShutdown);
+        savePowerLatchState();
+        stopIg3IfRequestedByUs();
+        return setParkingPowerKeep(false, confirmShutdown);
+    }
+
+    /**
+     * Sends IG3 OFF (reqEVIG3Change(false) & sendIG3RlyMode((byte) 0)) ONLY if our app
+     * previously requested IG3 ON (scheduled 1h mode or manual IG3 test), so we never
+     * interrupt the vehicle's own OEM Aux. Battery Saver+ charging or driving IG3 state.
+     */
+    public static synchronized boolean stopIg3IfRequestedByUs() {
+        File flagFile = new File(IG3_REQ_FLAG_PATH);
+        if (!weRequestedIg3On && ! manualIg3TestActive && !flagFile.isFile()) {
+            return false;
+        }
+        return triggerIg3Charging(false, false);
     }
 
     private static void manageWakeLock(boolean acquire) {
@@ -551,10 +634,23 @@ public final class HkmcVehicleBridge {
 
     /**
      * Requests turning IG3 (12V Aux Battery Saver+ / LDC Charging) ON or OFF.
-     * Does NOT falsify telemetry values; actual vehicle response is observed via HEVListener / getLastIGN3Status.
+     * Uses TM_HSCANAdapter.sendIG3RlyMode(byte) per firmware signature (B)V.
      */
     public static synchronized boolean triggerIg3Charging(boolean enable, boolean isManualTest) {
         manualIg3TestActive = isManualTest && enable;
+        weRequestedIg3On = enable;
+        try {
+            File flagFile = new File(IG3_REQ_FLAG_PATH);
+            if (enable) {
+                File p = flagFile.getParentFile();
+                if (p != null && !p.exists()) p.mkdirs();
+                AuxMonModels.writeBytesDirect(flagFile, "1\n".getBytes(AuxMonModels.UTF8));
+            } else if (flagFile.exists()) {
+                flagFile.delete();
+            }
+        } catch (Throwable ignored) {
+        }
+
         boolean invokedAny = false;
 
         if (hevMgr != null) {
@@ -566,7 +662,6 @@ public final class HkmcVehicleBridge {
                 System.out.println("[AuxMon] reqEVIG3Change error: " + t);
             }
             try {
-                // Request asynchronous status refresh from HEVService
                 hevMgr.getClass().getMethod("getIGN3Status").invoke(hevMgr);
             } catch (Throwable ignored) {
             }
@@ -574,10 +669,10 @@ public final class HkmcVehicleBridge {
 
         if (hscanAdapter != null) {
             try {
-                int mode = enable ? 1 : 0;
-                hscanAdapter.getClass().getMethod("sendIG3RlyMode", int.class).invoke(hscanAdapter, Integer.valueOf(mode));
+                byte mode = (byte) (enable ? 1 : 0);
+                hscanAdapter.getClass().getMethod("sendIG3RlyMode", byte.class).invoke(hscanAdapter, Byte.valueOf(mode));
                 invokedAny = true;
-                System.out.println("[AuxMon] TM_HSCANAdapter.sendIG3RlyMode(" + mode + ") invoked");
+                System.out.println("[AuxMon] TM_HSCANAdapter.sendIG3RlyMode((byte)" + mode + ") invoked");
             } catch (Throwable t) {
                 System.out.println("[AuxMon] sendIG3RlyMode error: " + t);
             }
@@ -599,9 +694,8 @@ public final class HkmcVehicleBridge {
                         public void onPowerStatusChanged(int status) {
                             cachedPowerStatus = status;
                             if (status == 0) {
-                                // ACCON: vehicle is running again
-                                safetyCutoffTripped = false;
-                                autoKeepOnShutdownEnabled = true;
+                                // ACCON: vehicle is running again -> clear safety cutoff & re-enable auto keep
+                                resetSafetyCutoff();
                             } else if ((status == 1 || status == 2 || status == 6 || status == 7)
                                     && autoKeepOnShutdownEnabled && !safetyCutoffTripped) {
                                 // Immediately assert PwrKeep(2) on LOGICON / ADM / DELAYMODE / PRESYSTEMOFF
@@ -615,9 +709,8 @@ public final class HkmcVehicleBridge {
                         public void onTeleAccStatusChanged(int status) {
                             cachedTeleAccStatus = status;
                             if (status == 2) {
-                                // TeleAcc ACCON
-                                safetyCutoffTripped = false;
-                                autoKeepOnShutdownEnabled = true;
+                                // TeleAcc ACCON -> clear safety cutoff & re-enable auto keep
+                                resetSafetyCutoff();
                             } else if (status == 1 && autoKeepOnShutdownEnabled && !safetyCutoffTripped) {
                                 // TeleAcc ACCOFF: immediately assert PwrKeep(2) before Micom starts shutdown
                                 sendPwrKeepStartImmediate("onTeleAccStatusChanged:ACCOFF");
