@@ -1,0 +1,34 @@
+# Build outputs
+build/
+out/
+dist/
+*.apk
+*.aab
+*.dex
+*.class
+*.jar
+*.zip
+*.o
+*.so
+*.dll
+*.exe
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+local.properties
+.env
+.env.*
+
+# Logs, dumps & review notes
+*.log
+captures/
+docs/

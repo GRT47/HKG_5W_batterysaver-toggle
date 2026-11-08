@@ -1,0 +1,19 @@
+[nemesis]
+version=1.0.0
+id=hkg.auxmon
+name=HKG 12V Aux Battery Parking Monitor
+types=application,service
+postinstall=scripts/post.sh
+preuninstall=scripts/preun.sh
+
+[app.0]
+kind=sh
+path=bin/launch.sh
+uid=root
+
+[service.0]
+name=hkg-auxmon
+kind=sh
+path=svc/auxmon-daemon.sh
+uid=root
+mode=background
