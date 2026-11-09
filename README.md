@@ -47,7 +47,75 @@
 
 ---
 
-## 2. 빌드 방법
+## 2. 설치 및 사용 방법
+
+> **주의**: 패키지 설치·업데이트·제거 시 `/system/xbin/nemesis`가 `preun.sh`(`release-keep`)를 실행하므로, 반드시 **차량 시동 ON (`ACCON`) 상태**에서 진행하세요.
+
+### 방법 A: USB 메모리로 설치 (권장)
+
+1. **USB 메모리 준비**:
+   - USB 메모리를 **`FAT32`** (또는 헤드유닛이 인식하는 `exFAT`)로 포맷합니다.
+2. **패키지 파일 복사** (아래 두 가지 중 편한 방법 선택):
+   - **번들 압축 해제**: [GitHub Releases](https://github.com/GRT47/HKG_5W_batterysaver-toggle/releases)에서 최신 **`HKG_5W_AuxBattery_Monitor_USB.zip`**을 다운로드하여 **USB 메모리 최상위(루트) 경로**에 압축을 풉니다.
+   - **단일 패키지 복사**: USB 메모리에 `packages` 폴더를 만든 뒤, 다운로드한 **`hkg.auxmon.zip`** 파일을 복사합니다.
+   - 최종 USB 경로 구조:
+     ```text
+     [USB 루트]/
+     └── packages/
+         └── hkg.auxmon.zip
+     ```
+3. **헤드유닛에서 설치**:
+   - 차량 시동 ON (`ACCON`) 상태에서 헤드유닛의 **데이터 통신용 USB 포트**에 USB 메모리를 꽂습니다.
+   - 헤드유닛의 **NEMESIS 패키지 매니저(앱 관리 메뉴)**를 열고 USB의 `hkg.auxmon` (`HKG 12V 보조배터리 주차 전압 & 자동충전 모니터`) 패키지를 선택해 **설치(Install) / 업데이트(Update)**를 실행합니다.
+   - 설치가 완료되면 약 2초 뒤 백그라운드 감시 서비스(`hkg-auxmon`)가 자동으로 시작됩니다.
+
+### 방법 B: ADB 또는 헤드유닛 터미널(Shell)에서 직접 설치
+
+ADB 또는 루트 쉘 접근이 가능한 경우 `hkg.auxmon.zip`을 이용해 직접 설치할 수 있습니다:
+
+```sh
+# 1. USB가 연결된 경우 USB에서 바로 설치
+/system/xbin/nemesis install /mnt/media_rw/usb0/packages/hkg.auxmon.zip
+
+# 2. 또는 /data/local/tmp로 전송 후 설치 (PC에서 adb push 실행 시)
+# adb push hkg.auxmon.zip /data/local/tmp/hkg.auxmon.zip
+/system/xbin/nemesis install /data/local/tmp/hkg.auxmon.zip
+```
+
+### 패널 실행 및 사용 방법
+
+1. **모니터 패널 열기**:
+   - NEMESIS 런처(앱 목록)에서 **`HKG 12V 보조배터리 주차 전압 & 자동충전 모니터`** 아이콘을 터치하면 화면 위에 오버레이 패널이 표시됩니다.
+   - 터미널에서 직접 패널을 띄우거나 숨기려면 다음 명령을 사용할 수 있습니다:
+     ```sh
+     # 패널 표시
+     /data/nemesis/apps/hkg.auxmon/bin/launch.sh
+     # 또는 명령 파일로 제어 (show / hide / toggle / demo / export)
+     echo "show" > /data/local/tmp/hkg_auxmon_cmd
+     ```
+2. **주차 감시 설정**:
+   - **`절전유지` 시간**: `-` / `+` 버튼 또는 시간 텍스트를 터치해 **`상시(무제한)`** (기본값) 또는 **`1 / 3 / 6 / 12 / 24 / 48시간`**(최대 72시간)을 설정합니다.
+   - **`주기`**: 주차 중 샘플링 및 폴링 주기를 **`10s / 30s / 60s`** (기본 `30s`) 중에서 선택합니다.
+   - **`모드`**:
+     - `순정 Aux.Saver+ 감시` (기본값): 차량 자체의 Aux. Battery Saver+(IG3) 작동 여부와 전압·SOC 변화를 그대로 관찰·기록합니다.
+     - `1시간 주기 IG3 강제충전`: 주차 중 1시간마다(또는 SOC 75% 이하 시) `HEVManager.reqEVIG3Change(true)`를 20분간 요청합니다.
+3. **자동 주차 기록 및 재시동 시 리포트 확인**:
+   - 설정 후 **시동을 끄면(ACC/IGN OFF)** 자동으로 `PwrKeep(2)`이 활성화되고 LCD 화면이 꺼진 채 절전 감시가 시작됩니다.
+   - 다음 주행을 위해 **다시 시동을 걸면(ACCON)** 주차 감시가 자동 종료·저장되며, 화면에 직전 주차 동안의 **전압 변화 그래프와 총 충전 횟수**가 자동으로 표시됩니다.
+   - USB 메모리를 꽂고 패널 우측 하단의 **`💾 데이터 내보내기 (USB 저장)`** 버튼을 누르면 USB의 `hkg_aux_battery_logs/` 폴더에 CSV·JSON·한글 리포트가 저장됩니다.
+
+### 패키지 제거 (Uninstall) 방법
+
+- **NEMESIS 메뉴에서 제거**: 차량 시동 ON 상태에서 NEMESIS 패키지 매니저를 열고 `hkg.auxmon`을 선택해 **제거(Uninstall)**합니다.
+- **터미널에서 제거**:
+  ```sh
+  /system/xbin/nemesis uninstall hkg.auxmon
+  ```
+- 제거 시 `scripts/preun.sh`가 실행되어 백그라운드 데몬을 종료하고 `MicomPowerManager.requestPwrKeepStop(2)` 원샷을 호출해 전원 유지 상태를 안전하게 해제합니다.
+
+---
+
+## 3. 소스 빌드 방법
 
 ```bash
 python build_package.py
@@ -62,7 +130,7 @@ python build_package.py
 
 ---
 
-## 3. USB 내보내기 파일 구조
+## 4. USB 내보내기 파일 구조
 
 패널 하단의 **`💾 데이터 내보내기 (USB 저장)`** 버튼을 누르면(기록된 세션이 없을 때는 가짜 데이터를 만들지 않고 안내 메시지를 표시합니다), 연결된 USB 메모리(`/mnt/media_rw/usb0`, `/storage/usb0` 등)의 `hkg_aux_battery_logs/` 폴더에 세션별(`_<sessionId>`)로 다음 4종의 파일이 저장됩니다:
 
