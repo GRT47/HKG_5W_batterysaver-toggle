@@ -132,10 +132,19 @@ def main():
     shutil.copy2(JAR_OUT, STAGE_DIR / "bin" / "auxmon.jar")
 
     # 6. Create USB distribution structure:
+    #    NEMESIS.data (USB auto-install trigger)
     #    packages/hkg.auxmon.zip
     if USB_STAGE_DIR.exists():
         shutil.rmtree(USB_STAGE_DIR)
     PKG_ZIP_OUT.parent.mkdir(parents=True, exist_ok=True)
+
+    usb_nemesis_data = (
+        "[nemesis]\n"
+        "version=1.0\n"
+        "type=install\n"
+        "path=packages/hkg.auxmon.zip\n"
+    )
+    (USB_STAGE_DIR / "NEMESIS.data").write_bytes(usb_nemesis_data.encode("utf-8"))
 
     with zipfile.ZipFile(PKG_ZIP_OUT, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for file_path in sorted(STAGE_DIR.rglob("*")):
@@ -153,6 +162,10 @@ def main():
                 zf.write(file_path, rel)
 
     print(f"Created USB root bundle: {DIST_ZIP_OUT} ({DIST_ZIP_OUT.stat().st_size} bytes)")
+    print("\n=== USB Bundle Contents (HKG_5W_AuxBattery_Monitor_USB.zip) ===")
+    with zipfile.ZipFile(DIST_ZIP_OUT, "r") as zf:
+        for info in zf.infolist():
+            print(f"  {info.filename:30s}  {info.file_size:8d} bytes")
     print("\n=== Package Contents (packages/hkg.auxmon.zip) ===")
     with zipfile.ZipFile(PKG_ZIP_OUT, "r") as zf:
         for info in zf.infolist():

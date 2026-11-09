@@ -55,18 +55,17 @@
 
 1. **USB 메모리 준비**:
    - USB 메모리를 **`FAT32`** (또는 헤드유닛이 인식하는 `exFAT`)로 포맷합니다.
-2. **패키지 파일 복사** (아래 두 가지 중 편한 방법 선택):
-   - **번들 압축 해제**: [GitHub Releases](https://github.com/GRT47/HKG_5W_batterysaver-toggle/releases)에서 최신 **`HKG_5W_AuxBattery_Monitor_USB.zip`**을 다운로드하여 **USB 메모리 최상위(루트) 경로**에 압축을 풉니다.
-   - **단일 패키지 복사**: USB 메모리에 `packages` 폴더를 만든 뒤, 다운로드한 **`hkg.auxmon.zip`** 파일을 복사합니다.
-   - 최종 USB 경로 구조:
+2. **패키지 파일 복사**:
+   - [GitHub Releases](https://github.com/GRT47/HKG_5W_batterysaver-toggle/releases)에서 최신 **`HKG_5W_AuxBattery_Monitor_USB.zip`**을 다운로드하여 **USB 메모리 최상위(루트) 경로**에 그대로 압축을 풉니다.
+   - 압축을 풀면 USB 루트에 자동 설치 트리거용 `NEMESIS.data`(`type=install`, `path=packages/hkg.auxmon.zip`)와 패키지 본체가 함께 배치됩니다:
      ```text
      [USB 루트]/
+     ├── NEMESIS.data
      └── packages/
          └── hkg.auxmon.zip
      ```
 3. **헤드유닛에서 설치**:
-   - 차량 시동 ON (`ACCON`) 상태에서 헤드유닛의 **데이터 통신용 USB 포트**에 USB 메모리를 꽂습니다.
-   - 헤드유닛의 **NEMESIS 패키지 매니저(앱 관리 메뉴)**를 열고 USB의 `hkg.auxmon` (`HKG 12V 보조배터리 주차 전압 & 자동충전 모니터`) 패키지를 선택해 **설치(Install) / 업데이트(Update)**를 실행합니다.
+   - 차량 시동 ON (`ACCON`) 상태에서 헤드유닛의 **데이터 통신용 USB 포트**에 USB 메모리를 꽂으면 NEMESIS가 USB 루트의 `NEMESIS.data`를 인식해 `packages/hkg.auxmon.zip`을 설치합니다.
    - 설치가 완료되면 약 2초 뒤 백그라운드 감시 서비스(`hkg-auxmon`)가 자동으로 시작됩니다.
 
 ### 방법 B: ADB 또는 헤드유닛 터미널(Shell)에서 직접 설치
