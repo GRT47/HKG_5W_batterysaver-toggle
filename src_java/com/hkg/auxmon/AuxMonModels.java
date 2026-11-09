@@ -96,7 +96,7 @@ public final class AuxMonModels {
             if (powerStatus == 1 || powerStatus == 2 || powerStatus == 6 || powerStatus == 7 || powerStatus == 255) {
                 return false;
             }
-            if (teleAccStatus == 1) {
+            if (teleAccStatus == 1 || teleAccStatus == 2) {
                 return false;
             }
             return ignOn || accOn;

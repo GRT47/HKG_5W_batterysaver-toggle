@@ -29,7 +29,8 @@
      6. **실측 전압 하한**: 직접 측정된 전압(`SYSFS_ADC` / `SYS_PROP`)이 `11.55V` 미만일 때
      7. **SOC 미확인 시간 한도**: 주차 중 SOC 미확인(`-1`) 상태가 **30분 이상** 지속될 때
    - 주차 중 수동 중지 및 안전 차단 상태는 `power_latch.txt`에 영구 저장되어 데몬 재시작이나 원격 시동/공조(`TeleAcc == 2`)에도 풀리지 않으며, 실제 시동 ON(`powerStatus == 0`) 또는 사용자의 수동 시작 시에만 해제됩니다.
-   - 패키지 업데이트(`scripts/post.sh`) 시에는 `update` 인계 모드를 사용해 이전 래퍼의 `on_stop`이 `PwrKeep`을 해제하거나 새 프로세스의 PID 파일을 지우지 않고 종료될 때까지 대기한 뒤 새 데몬이 유지를 이어받으며, 서비스 정지·제거(`scripts/preun.sh`) 시에는 `AuxMonMain release-keep` 원샷(실패 시 1회 재시도 및 `logcat` 기록)으로 `PwrKeep(2)` 해제를 보장합니다.
+   - 데몬 중지(`on_stop`) 또는 패키지 제거·업데이트(`scripts/preun.sh`) 시에는 자기 PID가 일치할 때만 PID 파일을 지우며, 리스너 등록 없이 `Looper.prepareMainLooper()`가 준비된 `AuxMonMain release-keep` 원샷(실패 시 1회 재시도 및 `logcat` 기록)을 실행하여 `PwrKeep(2)` 해제를 보장합니다.
+   - **패키지 업데이트 안내**: `/system/xbin/nemesis`는 패키지 업데이트 시 기존 설치본의 `preun.sh`(`release-keep` 및 `confirmSystemOff`)를 먼저 실행한 뒤 새 `post.sh`를 실행하므로, **패키지 설치 및 업데이트는 반드시 시동 ON (`ACCON`) 상태에서 진행**하세요.
 
 4. **정직한 차량 텔레메트리 수집 및 충전 횟수 감지**
    - **사용 API**:

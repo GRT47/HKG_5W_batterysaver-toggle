@@ -30,7 +30,7 @@ import java.util.Locale;
  */
 public class AuxMonMain {
 
-    public static final String VERSION = "1.4.0";
+    public static final String VERSION = "1.4.1";
     private static final String CMD_FILE_PATH = "/data/local/tmp/hkg_auxmon_cmd";
     private static final String STATE_JSON_PATH = "/data/local/tmp/hkg_auxmon_state.json";
     private static final String CONFIG_FILE_PATH = "/data/local/tmp/hkg_auxmon/config.txt";
@@ -240,8 +240,8 @@ public class AuxMonMain {
                         // Session started in LOGICON(1)/ADM(2)/TELE_ACC_OFF and now entered DELAYMODE(6)/PRESYSTEMOFF(7)
                         AuxMonOverlay.hideOverlay();
                         HkmcVehicleBridge.setScreenSleepMode(true);
-                    } else if (wasShutdownState && !isShutdownNow) {
-                        // Transitioned from DELAYMODE(6)/PRESYSTEMOFF(7) back to LOGICON(1)/ADM(2) -> restore LCD screen
+                    } else if (wasShutdownState && (snap.powerStatus == 0 || snap.powerStatus == 1 || snap.powerStatus == 2)) {
+                        // Transitioned from DELAYMODE(6)/PRESYSTEMOFF(7) to ACCON(0)/LOGICON(1)/ADM(2) -> restore LCD screen
                         HkmcVehicleBridge.setScreenSleepMode(false);
                     }
                     wasDriving = isDrivingNow;
@@ -966,6 +966,13 @@ public class AuxMonMain {
             snapRemoteClimate.ig3On = true; // IG3 turned on by remote climate
             assertTrue(!snapRemoteClimate.isDrivingState(), "Remote climate (powerStatus=6, teleAccStatus=2) must NOT be treated as driving");
             assertTrue(!snapRemoteClimate.isChargingActive(), "Remote climate (teleAccStatus=2 while parked) must NOT be counted as Aux. Battery Saver+ charging");
+
+            LiveTelemetrySnapshot snapSysReadyTeleAcc2 = new LiveTelemetrySnapshot();
+            snapSysReadyTeleAcc2.powerStatus = 5; // SYSTEMREADY
+            snapSysReadyTeleAcc2.teleAccStatus = 2; // Stale TeleAcc=2
+            snapSysReadyTeleAcc2.accOn = false;
+            snapSysReadyTeleAcc2.ignOn = false;
+            assertTrue(!snapSysReadyTeleAcc2.isDrivingState(), "SYSTEMREADY(5) with teleAccStatus=2 must NOT be treated as driving");
 
             // 3. Test Safety Cutoff Rules & Conditional IG3 OFF
             LiveTelemetrySnapshot snapUnnormal = new LiveTelemetrySnapshot();

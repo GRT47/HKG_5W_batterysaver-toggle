@@ -143,24 +143,16 @@ start_mon_java() {
 }
 
 on_stop() {
-    stop_mode="$(cat "$STOP_FLAG" 2>/dev/null)"
     saved_mon_pid="$MON_PID"
-    if [ "$stop_mode" = "update" ]; then
-        log_info "Service stopping for package update handover; preserving PwrKeep state for new daemon..."
-        kill_mon_java
-    else
-        log_info "Service stopping via signal; releasing PwrKeep & IG3..."
-        release_power_keep_safely
-    fi
+    log_info "Service stopping via signal; releasing PwrKeep & IG3..."
+    release_power_keep_safely
     if [ -f "$SVC_PID_FILE" ] && [ "$(cat "$SVC_PID_FILE" 2>/dev/null)" = "$$" ]; then
         rm -f "$SVC_PID_FILE" 2>/dev/null
     fi
     if [ -n "$saved_mon_pid" ] && [ -f "$JAVA_PID_FILE" ] && [ "$(cat "$JAVA_PID_FILE" 2>/dev/null)" = "$saved_mon_pid" ]; then
         rm -f "$JAVA_PID_FILE" 2>/dev/null
     fi
-    if [ "$stop_mode" != "update" ]; then
-        rm -f "$STOP_FLAG" 2>/dev/null
-    fi
+    rm -f "$STOP_FLAG" 2>/dev/null
     exit 0
 }
 trap 'on_stop' TERM INT
