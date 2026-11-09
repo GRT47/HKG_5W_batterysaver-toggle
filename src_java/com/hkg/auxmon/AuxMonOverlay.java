@@ -10,76 +10,138 @@ import java.lang.reflect.Field;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
 /**
- * Interactive WindowManager Overlay Panel (TYPE_VOLUME_OVERLAY = 2020) for Gen5W (Android 4.4.2).
+ * Full-screen WindowManager overlay panel (TYPE_VOLUME_OVERLAY = 2020 first) for Gen5W (Android 4.4.2).
  *
- * Displays:
- *   1. N-hour parking configuration & Passive/Active-1h IG3 auto-charge mode controls
- *   2. 4 KPI summary cards (12V Voltage V, 12V SOC %, Charging Count, Elapsed/Target N hours)
- *   3. Real-time Canvas time-series voltage & IG3 charging timeline graph
- *   4. Charging event history table (#1, #2, ...) & recent voltage records
- *   5. One-click [데이터 내보내기 (USB 저장)] action button
+ * Layout (full screen, 1920x720 @ 240dpi on Gen5W, but sized from the real display at runtime):
+ *   Header : title, [작게 보기] (switch to a small draggable pill), [닫기]
+ *   Left   : current state (plain language), elapsed keep time, one large primary button
+ *            (start keep / stop keep with a second-tap confirmation because stopping while parked
+ *            powers the headunit off immediately)
+ *   Right  : 4 tabs - 한눈에 보기 (4 tiles) / 전압 그래프 / 충전 기록 (+USB export) / 설정
+ *   Bottom : status message banner
+ *
+ * Everything is accessed through reflection because the package is compiled against a minimal stub
+ * classpath and executed with app_process (no APK, no resources).
  */
 public final class AuxMonOverlay {
 
-    private static final int MAX_SCREEN_X = 1840;
-    private static final int MAX_SCREEN_Y = 680;
-    private static final int CARD_WIDTH = 860;
-    private static final int CHART_WIDTH = 828;
-    private static final int CHART_HEIGHT = 156;
+    // ------------------------------------------------------------------------
+    // Palette
+    // ------------------------------------------------------------------------
+    private static final int C_BG = 0xFF0B1220;
+    private static final int C_SURFACE = 0xFF121B2D;
+    private static final int C_SURFACE_2 = 0xFF1A2540;
+    private static final int C_BORDER = 0xFF27344F;
+    private static final int C_TEXT = 0xFFF1F5F9;
+    private static final int C_TEXT_SUB = 0xFF94A3B8;
+    private static final int C_TEXT_DIM = 0xFF64748B;
+    private static final int C_BLUE = 0xFF38BDF8;
+    private static final int C_GREEN = 0xFF34D399;
+    private static final int C_AMBER = 0xFFFBBF24;
+    private static final int C_RED = 0xFFF87171;
+    private static final int C_ON_ACCENT = 0xFF0B1220;
 
+    // ------------------------------------------------------------------------
+    // Android constants (avoid compile-time dependency on android.jar)
+    // ------------------------------------------------------------------------
+    private static final int MATCH_PARENT = -1;
+    private static final int WRAP_CONTENT = -2;
+    private static final int GRAVITY_CENTER = 17;
+    private static final int GRAVITY_CENTER_VERTICAL = 16;
+    private static final int GRAVITY_TOP_LEFT = 51;
+    private static final int VISIBLE = 0;
+    private static final int GONE = 8;
+    private static final int FLAG_NOT_FOCUSABLE = 0x00000008;
+    private static final int FLAG_NOT_TOUCH_MODAL = 0x00000020;
+    private static final int FLAG_LAYOUT_IN_SCREEN = 0x00000100;
+    private static final int FLAG_LAYOUT_NO_LIMITS = 0x00000200;
+    private static final int FLAG_FULLSCREEN = 0x00000400;
+    private static final int PIXEL_FORMAT_TRANSLUCENT = -3;
+
+    private static final int TAB_OVERVIEW = 0;
+    private static final int TAB_CHART = 1;
+    private static final int TAB_HISTORY = 2;
+    private static final int TAB_SETTINGS = 3;
+    private static final String[] TAB_LABELS = new String[]{"한눈에 보기", "전압 그래프", "충전 기록", "설정"};
+    private static final int[] HOUR_PRESETS = new int[]{0, 1, 3, 6, 12, 24, 48};
+    private static final int[] INTERVAL_PRESETS = new int[]{10, 30, 60};
+    private static final long STOP_CONFIRM_WINDOW_MS = 4000L;
+
+    // ------------------------------------------------------------------------
+    // Window / context
+    // ------------------------------------------------------------------------
     private static volatile Object uiHandler = null;
     private static volatile Object sysContext = null;
     private static volatile Object windowManager = null;
     private static volatile Object rootOverlayView = null;
     private static volatile Object currentWmLp = null;
+    private static volatile float density = 1.5f;
 
+    // ------------------------------------------------------------------------
     // Views
-    private static volatile Object compactRowView = null;
-    private static volatile Object compactTextView = null;
-    private static volatile Object expandedBoxView = null;
+    // ------------------------------------------------------------------------
+    private static Object compactRowView = null;
+    private static Object compactTextView = null;
+    private static Object fullBoxView = null;
 
-    private static volatile Object badgeTextView = null;
-    private static volatile Object nHoursValueTv = null;
-    private static volatile Object sampleIntervalBtnTv = null;
-    private static volatile Object modeBtnTv = null;
-    private static volatile Object sessionNavTv = null;
+    private static Object heroTitleTv = null;
+    private static Object heroDescTv = null;
+    private static Object heroTimeCaptionTv = null;
+    private static Object heroTimeTv = null;
+    private static Object heroTargetTv = null;
+    private static Object primaryBtnTv = null;
+    private static Object primaryHintTv = null;
 
-    // 4 KPI Cards
-    private static volatile Object kpiVoltMainTv = null;
-    private static volatile Object kpiVoltSubTv = null;
-    private static volatile Object kpiSocMainTv = null;
-    private static volatile Object kpiSocSubTv = null;
-    private static volatile Object kpiChgMainTv = null;
-    private static volatile Object kpiChgSubTv = null;
-    private static volatile Object kpiTimeMainTv = null;
-    private static volatile Object kpiTimeSubTv = null;
+    private static final Object[] tabButtons = new Object[TAB_LABELS.length];
+    private static final Object[] tabPages = new Object[TAB_LABELS.length];
 
-    // Canvas Chart ImageView & Bitmap
-    private static volatile Object chartImageView = null;
-    private static volatile Object chartBitmap = null;
+    private static Object tileVoltValueTv = null;
+    private static Object tileVoltSubTv = null;
+    private static Object tileSocValueTv = null;
+    private static Object tileSocSubTv = null;
+    private static Object tileChgValueTv = null;
+    private static Object tileChgSubTv = null;
+    private static Object tileProtValueTv = null;
+    private static Object tileProtSubTv = null;
 
-    // Charge Event History & Log TextViews
-    private static volatile Object chargeHistoryHeaderTv = null;
-    private static volatile Object chargeHistoryBodyTv = null;
+    private static Object chartImageView = null;
+    private static Object chartBitmap = null;
+    private static int chartBmpW = 0;
+    private static int chartBmpH = 0;
+    private static Object chartNavTv = null;
+    private static Object historyNavTv = null;
+    private static Object historyBodyTv = null;
 
-    // Bottom Action Buttons & Notice Banner
-    private static volatile Object startStopParkingBtnTv = null;
-    private static volatile Object manualIg3BtnTv = null;
-    private static volatile Object exportUsbBtnTv = null;
-    private static volatile Object bottomNoticeTv = null;
+    private static final Object[] hourChips = new Object[HOUR_PRESETS.length];
+    private static Object hourValueTv = null;
+    private static final Object[] intervalChips = new Object[INTERVAL_PRESETS.length];
+    private static final Object[] modeChips = new Object[2];
+    private static Object modeDescTv = null;
+    private static Object ig3TestBtnTv = null;
 
+    private static Object bannerTv = null;
+
+    // ------------------------------------------------------------------------
+    // UI state
+    // ------------------------------------------------------------------------
     private static volatile boolean isVisible = false;
     private static volatile boolean compactMode = false;
     private static volatile boolean hiddenForRearCam = false;
     private static volatile int winX = 480;
     private static volatile int winY = 24;
-    private static volatile int lastBorderColor = 0;
+    private static volatile int currentTab = TAB_OVERVIEW;
+    private static volatile long stopConfirmUntilRt = 0L;
+
+    /** Last applied background per view, so the 1 s refresh does not allocate drawables needlessly. */
+    private static final Map<Object, Long> bgCache = new IdentityHashMap<Object, Long>();
 
     private static final CountDownLatch uiLooperLatch = new CountDownLatch(1);
 
@@ -97,8 +159,39 @@ public final class AuxMonOverlay {
         }
     };
 
+    // ------------------------------------------------------------------------
+    // Reflection cache
+    // ------------------------------------------------------------------------
+    private static boolean reflReady = false;
+    private static Class<?> cView;
+    private static Class<?> cLinear;
+    private static Class<?> cTextView;
+    private static Constructor<?> ctorLinear;
+    private static Constructor<?> ctorText;
+    private static Constructor<?> ctorImage;
+    private static Constructor<?> ctorScroll;
+    private static Constructor<?> ctorLlLp2;
+    private static Constructor<?> ctorLlLp3;
+    private static Constructor<?> ctorFlLp2;
+    private static Method mAddView;
+    private static Method mSetPadding;
+    private static Method mSetVisibility;
+    private static Method mSetAlpha;
+    private static Method mSetOrientation;
+    private static Method mLlSetGravity;
+    private static Method mTvSetGravity;
+    private static Method mSetText;
+    private static Method mSetTextColor;
+    private static Method mSetTextSize;
+    private static Method mSetMargins;
+    private static Method mSetMinHeight;
+
     private AuxMonOverlay() {
     }
+
+    // ========================================================================
+    // PUBLIC API (called from AuxMonMain)
+    // ========================================================================
 
     public static boolean isUiLooperReady() {
         return uiHandler != null;
@@ -152,10 +245,27 @@ public final class AuxMonOverlay {
         }
     }
 
+    /** Opens the full-screen panel (user-initiated: app icon, show/start/demo/export commands). */
     public static void showOverlay() {
         postToUi(new Runnable() {
             @Override
             public void run() {
+                compactMode = false;
+                showOnUiThread();
+            }
+        });
+    }
+
+    /**
+     * Shows only the small pill (automatic pop-ups such as "driving resumed"), so the panel never
+     * covers navigation while the vehicle is being driven. An already open full-screen panel is
+     * shrunk to the pill as well.
+     */
+    public static void showOverlayCompact() {
+        postToUi(new Runnable() {
+            @Override
+            public void run() {
+                compactMode = true;
                 showOnUiThread();
             }
         });
@@ -177,6 +287,7 @@ public final class AuxMonOverlay {
                 if (isVisible) {
                     hideOnUiThread();
                 } else {
+                    compactMode = false;
                     showOnUiThread();
                 }
             }
@@ -186,6 +297,10 @@ public final class AuxMonOverlay {
     public static void requestRefresh() {
         postToUi(REFRESH_UI_TASK);
     }
+
+    // ========================================================================
+    // HANDLER HELPERS
+    // ========================================================================
 
     private static void postToUi(Runnable r) {
         Object h = uiHandler;
@@ -242,6 +357,17 @@ public final class AuxMonOverlay {
                 Method getSysSvc = sysContext.getClass().getMethod("getSystemService", String.class);
                 windowManager = getSysSvc.invoke(sysContext, "window");
             }
+            if (sysContext != null) {
+                try {
+                    Object res = sysContext.getClass().getMethod("getResources").invoke(sysContext);
+                    Object dm = res.getClass().getMethod("getDisplayMetrics").invoke(res);
+                    float d = dm.getClass().getField("density").getFloat(dm);
+                    if (d > 0.5f && d < 5.0f) {
+                        density = d;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
         } catch (Throwable t) {
             sysContext = null;
             windowManager = null;
@@ -249,428 +375,697 @@ public final class AuxMonOverlay {
         return sysContext != null && windowManager != null;
     }
 
-    private static Object buildOverlayViewTree() throws Exception {
+    // ========================================================================
+    // REFLECTION HELPERS
+    // ========================================================================
+
+    private static void ensureReflection() throws Exception {
+        if (reflReady) return;
         Class<?> ctxCls = Class.forName("android.content.Context");
-        Class<?> viewCls = Class.forName("android.view.View");
+        cView = Class.forName("android.view.View");
         Class<?> vgCls = Class.forName("android.view.ViewGroup");
         Class<?> vgLpCls = Class.forName("android.view.ViewGroup$LayoutParams");
-        Class<?> llCls = Class.forName("android.widget.LinearLayout");
+        cLinear = Class.forName("android.widget.LinearLayout");
         Class<?> llLpCls = Class.forName("android.widget.LinearLayout$LayoutParams");
-        Class<?> tvCls = Class.forName("android.widget.TextView");
+        Class<?> flLpCls = Class.forName("android.widget.FrameLayout$LayoutParams");
+        cTextView = Class.forName("android.widget.TextView");
         Class<?> ivCls = Class.forName("android.widget.ImageView");
-        Class<?> scaleTypeCls = Class.forName("android.widget.ImageView$ScaleType");
+        Class<?> svCls = Class.forName("android.widget.ScrollView");
+        Class<?> mlpCls = Class.forName("android.view.ViewGroup$MarginLayoutParams");
 
-        Constructor<?> llCtor = llCls.getConstructor(ctxCls);
-        Constructor<?> tvCtor = tvCls.getConstructor(ctxCls);
-        Constructor<?> ivCtor = ivCls.getConstructor(ctxCls);
-        Constructor<?> llLpCtor2 = llLpCls.getConstructor(int.class, int.class);
-        Constructor<?> llLpCtor3 = llLpCls.getConstructor(int.class, int.class, float.class);
+        ctorLinear = cLinear.getConstructor(ctxCls);
+        ctorText = cTextView.getConstructor(ctxCls);
+        ctorImage = ivCls.getConstructor(ctxCls);
+        ctorScroll = svCls.getConstructor(ctxCls);
+        ctorLlLp2 = llLpCls.getConstructor(int.class, int.class);
+        ctorLlLp3 = llLpCls.getConstructor(int.class, int.class, float.class);
+        ctorFlLp2 = flLpCls.getConstructor(int.class, int.class);
 
-        Method addView = vgCls.getMethod("addView", viewCls, vgLpCls);
-        Method setPad = viewCls.getMethod("setPadding", int.class, int.class, int.class, int.class);
-        Method setGravity = llCls.getMethod("setGravity", int.class);
-        Method tvSetGravity = tvCls.getMethod("setGravity", int.class);
+        mAddView = vgCls.getMethod("addView", cView, vgLpCls);
+        mSetPadding = cView.getMethod("setPadding", int.class, int.class, int.class, int.class);
+        mSetVisibility = cView.getMethod("setVisibility", int.class);
+        mSetAlpha = cView.getMethod("setAlpha", float.class);
+        mSetMinHeight = cView.getMethod("setMinimumHeight", int.class);
+        mSetOrientation = cLinear.getMethod("setOrientation", int.class);
+        mLlSetGravity = cLinear.getMethod("setGravity", int.class);
+        mTvSetGravity = cTextView.getMethod("setGravity", int.class);
+        mSetText = cTextView.getMethod("setText", CharSequence.class);
+        mSetTextColor = cTextView.getMethod("setTextColor", int.class);
+        mSetTextSize = cTextView.getMethod("setTextSize", int.class, float.class);
+        mSetMargins = mlpCls.getMethod("setMargins", int.class, int.class, int.class, int.class);
+        reflReady = true;
+    }
 
-        final int MATCH_PARENT = -1;
-        final int WRAP_CONTENT = -2;
+    private static int dp(float v) {
+        return Math.round(v * density);
+    }
 
-        Object root = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(root, 1); // VERTICAL
-        setRoundedBg(root, 0xF40B111E, 0xFF38BDF8, 2, 16f);
-        lastBorderColor = 0xFF38BDF8;
+    private static Object vbox() throws Exception {
+        Object ll = ctorLinear.newInstance(sysContext);
+        mSetOrientation.invoke(ll, 1);
+        return ll;
+    }
+
+    private static Object hbox() throws Exception {
+        Object ll = ctorLinear.newInstance(sysContext);
+        mSetOrientation.invoke(ll, 0);
+        mLlSetGravity.invoke(ll, GRAVITY_CENTER_VERTICAL);
+        return ll;
+    }
+
+    private static Object text(String s, float sp, int color, boolean bold) throws Exception {
+        Object tv = ctorText.newInstance(sysContext);
+        mSetText.invoke(tv, s);
+        mSetTextSize.invoke(tv, 2, sp); // COMPLEX_UNIT_SP
+        mSetTextColor.invoke(tv, color);
+        if (bold) {
+            Class<?> tfCls = Class.forName("android.graphics.Typeface");
+            Object defaultBold = tfCls.getField("DEFAULT_BOLD").get(null);
+            cTextView.getMethod("setTypeface", tfCls, int.class).invoke(tv, defaultBold, 1);
+        }
+        try {
+            cTextView.getMethod("setLineSpacing", float.class, float.class).invoke(tv, 0f, 1.12f);
+        } catch (Throwable ignored) {
+        }
+        return tv;
+    }
+
+    private static void maxLines(Object tv, int lines) {
+        try {
+            cTextView.getMethod("setMaxLines", int.class).invoke(tv, lines);
+            Class<?> truncCls = Class.forName("android.text.TextUtils$TruncateAt");
+            Object end = truncCls.getField("END").get(null);
+            cTextView.getMethod("setEllipsize", truncCls).invoke(tv, end);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static Object lp(int w, int h) throws Exception {
+        return ctorLlLp2.newInstance(w, h);
+    }
+
+    private static Object lpw(int w, int h, float weight) throws Exception {
+        return ctorLlLp3.newInstance(w, h, weight);
+    }
+
+    private static Object margins(Object lp, int l, int t, int r, int b) throws Exception {
+        mSetMargins.invoke(lp, dp(l), dp(t), dp(r), dp(b));
+        return lp;
+    }
+
+    private static void add(Object parent, Object child, Object lp) throws Exception {
+        mAddView.invoke(parent, child, lp);
+    }
+
+    private static void pad(Object v, int l, int t, int r, int b) throws Exception {
+        mSetPadding.invoke(v, dp(l), dp(t), dp(r), dp(b));
+    }
+
+    private static void vis(Object v, boolean visible) {
+        if (v == null) return;
+        try {
+            mSetVisibility.invoke(v, visible ? VISIBLE : GONE);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void setText(Object tv, String s) {
+        if (tv == null) return;
+        try {
+            mSetText.invoke(tv, s);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void setColor(Object tv, int color) {
+        if (tv == null) return;
+        try {
+            mSetTextColor.invoke(tv, color);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** Rounded background with stroke; skipped when the same colors are already applied to this view. */
+    private static void bg(Object view, int fill, int stroke, float strokeDp, float radiusDp) {
+        if (view == null) return;
+        long key = (((long) fill) << 32) ^ (stroke & 0xFFFFFFFFL) ^ ((long) (radiusDp * 7f + strokeDp * 131f) << 20);
+        Long prev = bgCache.get(view);
+        if (prev != null && prev.longValue() == key) return;
+        try {
+            Class<?> gdCls = Class.forName("android.graphics.drawable.GradientDrawable");
+            Class<?> drawableCls = Class.forName("android.graphics.drawable.Drawable");
+            Object gd = gdCls.getConstructor().newInstance();
+            gdCls.getMethod("setColor", int.class).invoke(gd, fill);
+            gdCls.getMethod("setCornerRadius", float.class).invoke(gd, (float) dp(radiusDp));
+            if (strokeDp > 0f) {
+                gdCls.getMethod("setStroke", int.class, int.class).invoke(gd, Math.max(1, dp(strokeDp)), stroke);
+            }
+            cView.getMethod("setBackgroundDrawable", drawableCls).invoke(view, gd);
+            bgCache.put(view, Long.valueOf(key));
+        } catch (Throwable ignored) {
+        }
+    }
+
+    // ---- Button styles ------------------------------------------------------
+
+    private static Object button(String label, float sp, Runnable action) throws Exception {
+        Object b = text(label, sp, C_TEXT, true);
+        mTvSetGravity.invoke(b, GRAVITY_CENTER);
+        pad(b, 18, 10, 18, 10);
+        mSetMinHeight.invoke(b, dp(48));
+        styleSecondary(b);
+        attachTouch(b, action, false);
+        return b;
+    }
+
+    private static void styleSecondary(Object b) {
+        bg(b, C_SURFACE_2, C_BORDER, 1f, 10f);
+        setColor(b, C_TEXT);
+    }
+
+    private static void styleChip(Object b, boolean selected) {
+        if (selected) {
+            bg(b, C_BLUE, C_BLUE, 1f, 10f);
+            setColor(b, C_ON_ACCENT);
+        } else {
+            bg(b, C_SURFACE_2, C_BORDER, 1f, 10f);
+            setColor(b, C_TEXT);
+        }
+    }
+
+    // ========================================================================
+    // VIEW TREE
+    // ========================================================================
+
+    private static Object buildOverlayViewTree() throws Exception {
+        ensureReflection();
+        bgCache.clear();
+
+        Object root = vbox();
 
         // --------------------------------------------------------------------
-        // 1. Compact Pill View (when minimized)
+        // A. Compact pill (draggable, tap to open)
         // --------------------------------------------------------------------
-        Object compactRow = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(compactRow, 0);
-        setGravity.invoke(compactRow, 16);
-        setPad.invoke(compactRow, 18, 10, 18, 10);
-
-        Object cTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(cTv, "🔋 12V 보조배터리 주차 감시 중...", 14.5f, 0xFFF8FAFC, true);
-        addView.invoke(compactRow, cTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
-        attachButtonOrDragListener(compactRow, new Runnable() {
+        Object compactRow = hbox();
+        pad(compactRow, 16, 8, 8, 8);
+        Object cTv = text("🔋 주차 절전 유지", 15f, C_TEXT, true);
+        add(compactRow, cTv, lp(WRAP_CONTENT, WRAP_CONTENT));
+        Object openChip = text("크게 보기", 14f, C_ON_ACCENT, true);
+        mTvSetGravity.invoke(openChip, GRAVITY_CENTER);
+        pad(openChip, 14, 8, 14, 8);
+        bg(openChip, C_BLUE, C_BLUE, 1f, 10f);
+        add(compactRow, openChip, margins(lp(WRAP_CONTENT, WRAP_CONTENT), 14, 0, 0, 0));
+        attachTouch(compactRow, new Runnable() {
             @Override
             public void run() {
-                compactMode = false;
-                applyModeVisibilityOnUiThread();
-                refreshOnUiThread();
+                setCompactModeOnUiThread(false);
             }
-        });
-        addView.invoke(root, compactRow, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+        }, true);
+        add(root, compactRow, lp(WRAP_CONTENT, WRAP_CONTENT));
 
         // --------------------------------------------------------------------
-        // 2. Expanded Panel Container
+        // B. Full-screen panel
         // --------------------------------------------------------------------
-        Object expBox = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(expBox, 1);
-        setPad.invoke(expBox, 16, 12, 16, 12);
+        Object full = vbox();
+        pad(full, 20, 12, 20, 12);
 
-        // --- Row A: Top Title & Window Controls ---
-        Object headerRow = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(headerRow, 0);
-        setGravity.invoke(headerRow, 16);
-
-        Object titleTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(titleTv, "🔋 HKG 12V 보조배터리 주차 전압 & 자동충전(IG3) 기록기", 16.0f, 0xFFF8FAFC, true);
-        attachDragOnlyListener(titleTv);
-        addView.invoke(headerRow, titleTv, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
-
-        Object badgeTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(badgeTv, "감시 대기", 12.0f, 0xFF0F172A, true);
-        setPad.invoke(badgeTv, 12, 4, 12, 4);
-        setRoundedBg(badgeTv, 0xFF38BDF8, 0xFF38BDF8, 0, 10f);
-        Object badgeLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(badgeLp, 8, 0, 8, 0);
-        addView.invoke(headerRow, badgeTv, badgeLp);
-
-        Object minBtn = tvCtor.newInstance(sysContext);
-        setTextViewStyle(minBtn, "접기 —", 12.5f, 0xFFCBD5E1, true);
-        setPad.invoke(minBtn, 12, 4, 12, 4);
-        setRoundedBg(minBtn, 0xFF1E293B, 0xFF334155, 1, 8f);
-        attachButtonOrDragListener(minBtn, new Runnable() {
+        // B-1. Header
+        Object header = hbox();
+        Object title = text("🔋 주차 절전 유지", 22f, C_TEXT, true);
+        add(header, title, lp(WRAP_CONTENT, WRAP_CONTENT));
+        Object subtitle = text("시동을 꺼도 헤드유닛을 절전 상태로 유지하고 12V 보조배터리를 기록합니다", 14f, C_TEXT_SUB, false);
+        maxLines(subtitle, 1);
+        add(header, subtitle, margins(lpw(0, WRAP_CONTENT, 1f), 14, 0, 12, 0));
+        Object minBtn = button("작게 보기", 15f, new Runnable() {
             @Override
             public void run() {
-                compactMode = true;
-                applyModeVisibilityOnUiThread();
-                refreshOnUiThread();
+                setCompactModeOnUiThread(true);
             }
         });
-        Object minLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(minLp, 0, 0, 8, 0);
-        addView.invoke(headerRow, minBtn, minLp);
-
-        Object closeBtn = tvCtor.newInstance(sysContext);
-        setTextViewStyle(closeBtn, "닫기 ✕", 12.5f, 0xFFFCA5A5, true);
-        setPad.invoke(closeBtn, 12, 4, 12, 4);
-        setRoundedBg(closeBtn, 0xFF3B1219, 0xFFEF4444, 1, 8f);
-        attachButtonOrDragListener(closeBtn, new Runnable() {
+        add(header, minBtn, margins(lp(WRAP_CONTENT, WRAP_CONTENT), 0, 0, 10, 0));
+        Object closeBtn = button("닫기  ✕", 15f, new Runnable() {
             @Override
             public void run() {
                 hideOnUiThread();
             }
         });
-        addView.invoke(headerRow, closeBtn, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
-        addView.invoke(expBox, headerRow, llLpCtor2.newInstance(CARD_WIDTH, WRAP_CONTENT));
+        add(header, closeBtn, lp(WRAP_CONTENT, WRAP_CONTENT));
+        add(full, header, lp(MATCH_PARENT, WRAP_CONTENT));
 
-        // --- Row B: Configuration Bar (Parking N Hours + Auto-Charge Mode + Session Selector) ---
-        Object ctrlRow = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(ctrlRow, 0);
-        setGravity.invoke(ctrlRow, 16);
-        setPad.invoke(ctrlRow, 10, 6, 10, 6);
-        setRoundedBg(ctrlRow, 0xFF111C2D, 0xFF1E293B, 1, 10f);
-        Object ctrlRowLp = llLpCtor2.newInstance(CARD_WIDTH, WRAP_CONTENT);
-        setMargins(ctrlRowLp, 0, 8, 0, 8);
+        // B-2. Body
+        Object body = hbox();
+        mLlSetGravity.invoke(body, GRAVITY_TOP_LEFT);
+        add(body, buildHeroColumn(), lp(dp(400), MATCH_PARENT));
+        add(body, buildTabColumn(), margins(lpw(0, MATCH_PARENT, 1f), 14, 0, 0, 0));
+        add(full, body, margins(lpw(MATCH_PARENT, 0, 1f), 0, 10, 0, 0));
 
-        Object nLabelTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(nLabelTv, "절전유지:", 12.5f, 0xFF94A3B8, true);
-        addView.invoke(ctrlRow, nLabelTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+        // B-3. Banner
+        Object banner = text("", 14f, C_AMBER, false);
+        maxLines(banner, 1);
+        pad(banner, 14, 6, 14, 6);
+        bg(banner, C_SURFACE, C_BORDER, 1f, 10f);
+        add(full, banner, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 10, 0, 0));
+        bannerTv = banner;
 
-        Object minusBtn = createChipButton(tvCtor, setPad, " - ", 0xFF1E293B, 0xFF475569, 0xFFF8FAFC, new Runnable() {
+        add(root, full, lp(MATCH_PARENT, MATCH_PARENT));
+
+        compactRowView = compactRow;
+        compactTextView = cTv;
+        fullBoxView = full;
+        selectTabViews(currentTab);
+        return root;
+    }
+
+    private static Object buildHeroColumn() throws Exception {
+        Object col = vbox();
+        pad(col, 20, 12, 20, 12);
+        bg(col, C_SURFACE, C_BORDER, 1f, 14f);
+
+        add(col, text("현재 상태", 14f, C_TEXT_SUB, true), lp(MATCH_PARENT, WRAP_CONTENT));
+
+        heroTitleTv = text("대기 중", 26f, C_BLUE, true);
+        maxLines(heroTitleTv, 1);
+        add(col, heroTitleTv, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 2, 0, 0));
+
+        heroDescTv = text("", 15f, C_TEXT, false);
+        maxLines(heroDescTv, 3);
+        add(col, heroDescTv, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 4, 0, 0));
+
+        heroTimeCaptionTv = text("절전 유지 경과 시간", 14f, C_TEXT_SUB, true);
+        add(col, heroTimeCaptionTv, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 10, 0, 0));
+
+        heroTimeTv = text("--:--:--", 32f, C_TEXT, true);
+        add(col, heroTimeTv, lp(MATCH_PARENT, WRAP_CONTENT));
+
+        heroTargetTv = text("", 14f, C_TEXT_SUB, false);
+        maxLines(heroTargetTv, 1);
+        add(col, heroTargetTv, lp(MATCH_PARENT, WRAP_CONTENT));
+
+        add(col, ctorLinear.newInstance(sysContext), lpw(MATCH_PARENT, 0, 1f)); // spacer
+
+        primaryBtnTv = text("▶  지금 절전 유지 시작", 20f, C_TEXT, true);
+        mTvSetGravity.invoke(primaryBtnTv, GRAVITY_CENTER);
+        mSetMinHeight.invoke(primaryBtnTv, dp(60));
+        pad(primaryBtnTv, 12, 10, 12, 10);
+        attachTouch(primaryBtnTv, new Runnable() {
             @Override
             public void run() {
-                AuxMonMain.adjustTargetParkingHours(-1);
-                refreshOnUiThread();
+                onPrimaryButton();
             }
-        });
-        Object minusLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(minusLp, 6, 0, 4, 0);
-        addView.invoke(ctrlRow, minusBtn, minusLp);
+        }, false);
+        add(col, primaryBtnTv, lp(MATCH_PARENT, WRAP_CONTENT));
 
-        Object nValTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(nValTv, "상시(무제한)", 13.0f, 0xFF38BDF8, true);
-        setPad.invoke(nValTv, 10, 3, 10, 3);
-        setRoundedBg(nValTv, 0xFF0B1320, 0xFF0EA5E9, 1, 6f);
-        attachButtonOrDragListener(nValTv, new Runnable() {
-            @Override
-            public void run() {
-                AuxMonMain.cyclePresetParkingHours();
-                refreshOnUiThread();
-            }
-        });
-        addView.invoke(ctrlRow, nValTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
+        primaryHintTv = text("", 13f, C_TEXT_SUB, false);
+        mTvSetGravity.invoke(primaryHintTv, GRAVITY_CENTER);
+        maxLines(primaryHintTv, 2);
+        add(col, primaryHintTv, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 6, 0, 0));
+        return col;
+    }
 
-        Object plusBtn = createChipButton(tvCtor, setPad, " + ", 0xFF1E293B, 0xFF475569, 0xFFF8FAFC, new Runnable() {
-            @Override
-            public void run() {
-                AuxMonMain.adjustTargetParkingHours(1);
-                refreshOnUiThread();
-            }
-        });
-        Object plusLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(plusLp, 4, 0, 8, 0);
-        addView.invoke(ctrlRow, plusBtn, plusLp);
+    private static Object buildTabColumn() throws Exception {
+        Object col = vbox();
 
-        Object smpBtn = createChipButton(tvCtor, setPad, "주기: 30s", 0xFF1E293B, 0xFF334155, 0xFFCBD5E1, new Runnable() {
-            @Override
-            public void run() {
-                AuxMonMain.cycleSampleIntervalSec();
-                refreshOnUiThread();
-            }
-        });
-        Object smpLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(smpLp, 0, 0, 8, 0);
-        addView.invoke(ctrlRow, smpBtn, smpLp);
+        Object tabBar = hbox();
+        for (int i = 0; i < TAB_LABELS.length; i++) {
+            final int idx = i;
+            Object tab = text(TAB_LABELS[i], 17f, C_TEXT, true);
+            mTvSetGravity.invoke(tab, GRAVITY_CENTER);
+            mSetMinHeight.invoke(tab, dp(52));
+            attachTouch(tab, new Runnable() {
+                @Override
+                public void run() {
+                    selectTabOnUiThread(idx);
+                }
+            }, false);
+            add(tabBar, tab, margins(lpw(0, WRAP_CONTENT, 1f), i == 0 ? 0 : 8, 0, 0, 0));
+            tabButtons[i] = tab;
+        }
+        add(col, tabBar, lp(MATCH_PARENT, WRAP_CONTENT));
 
-        Object modeBtn = createChipButton(tvCtor, setPad, "모드: 순정 Aux.Saver+ 감시", 0xFF172554, 0xFF3B82F6, 0xFF93C5FD, new Runnable() {
-            @Override
-            public void run() {
-                AuxMonMain.toggleAutoChargeMode();
-                refreshOnUiThread();
-            }
-        });
-        addView.invoke(ctrlRow, modeBtn, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
+        Object pages = vbox();
+        tabPages[TAB_OVERVIEW] = buildOverviewPage();
+        tabPages[TAB_CHART] = buildChartPage();
+        tabPages[TAB_HISTORY] = buildHistoryPage();
+        tabPages[TAB_SETTINGS] = buildSettingsPage();
+        for (int i = 0; i < tabPages.length; i++) {
+            add(pages, tabPages[i], lp(MATCH_PARENT, MATCH_PARENT));
+        }
+        add(col, pages, margins(lpw(MATCH_PARENT, 0, 1f), 0, 10, 0, 0));
+        return col;
+    }
 
-        Object prevSessBtn = createChipButton(tvCtor, setPad, "◀", 0xFF1E293B, 0xFF334155, 0xFFCBD5E1, new Runnable() {
+    // ---- Tab 1: overview ----------------------------------------------------
+
+    private static Object buildOverviewPage() throws Exception {
+        Object page = vbox();
+        Object row1 = hbox();
+        Object row2 = hbox();
+        Object[] t1 = buildTile("12V 보조배터리 전압");
+        Object[] t2 = buildTile("보조배터리 충전율");
+        Object[] t3 = buildTile("주차 중 자동 충전");
+        Object[] t4 = buildTile("방전 보호");
+        add(row1, t1[0], margins(lpw(0, MATCH_PARENT, 1f), 0, 0, 5, 0));
+        add(row1, t2[0], margins(lpw(0, MATCH_PARENT, 1f), 5, 0, 0, 0));
+        add(row2, t3[0], margins(lpw(0, MATCH_PARENT, 1f), 0, 0, 5, 0));
+        add(row2, t4[0], margins(lpw(0, MATCH_PARENT, 1f), 5, 0, 0, 0));
+        add(page, row1, margins(lpw(MATCH_PARENT, 0, 1f), 0, 0, 0, 5));
+        add(page, row2, margins(lpw(MATCH_PARENT, 0, 1f), 0, 5, 0, 0));
+        tileVoltValueTv = t1[1];
+        tileVoltSubTv = t1[2];
+        tileSocValueTv = t2[1];
+        tileSocSubTv = t2[2];
+        tileChgValueTv = t3[1];
+        tileChgSubTv = t3[2];
+        tileProtValueTv = t4[1];
+        tileProtSubTv = t4[2];
+        return page;
+    }
+
+    private static Object[] buildTile(String label) throws Exception {
+        Object tile = vbox();
+        mLlSetGravity.invoke(tile, GRAVITY_CENTER_VERTICAL);
+        pad(tile, 18, 10, 18, 10);
+        bg(tile, C_SURFACE, C_BORDER, 1f, 14f);
+        add(tile, text(label, 15f, C_TEXT_SUB, true), lp(MATCH_PARENT, WRAP_CONTENT));
+        Object value = text("--", 30f, C_TEXT, true);
+        maxLines(value, 1);
+        add(tile, value, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 2, 0, 2));
+        Object sub = text("", 14f, C_TEXT_SUB, false);
+        maxLines(sub, 2);
+        add(tile, sub, lp(MATCH_PARENT, WRAP_CONTENT));
+        return new Object[]{tile, value, sub};
+    }
+
+    // ---- Tab 2: chart -------------------------------------------------------
+
+    private static Object buildChartPage() throws Exception {
+        Object page = vbox();
+        chartNavTv = buildSessionNavRow(page, false);
+
+        Object box = vbox();
+        pad(box, 8, 8, 8, 8);
+        bg(box, C_SURFACE, C_BORDER, 1f, 14f);
+        Class<?> ivCls = Class.forName("android.widget.ImageView");
+        Class<?> scaleTypeCls = Class.forName("android.widget.ImageView$ScaleType");
+        Object iv = ctorImage.newInstance(sysContext);
+        ivCls.getMethod("setScaleType", scaleTypeCls).invoke(iv, scaleTypeCls.getField("FIT_XY").get(null));
+        add(box, iv, lp(MATCH_PARENT, MATCH_PARENT));
+        add(page, box, margins(lpw(MATCH_PARENT, 0, 1f), 0, 8, 0, 0));
+        chartImageView = iv;
+        return page;
+    }
+
+    // ---- Tab 3: history -----------------------------------------------------
+
+    private static Object buildHistoryPage() throws Exception {
+        Object page = vbox();
+        historyNavTv = buildSessionNavRow(page, true);
+
+        Object scroll = ctorScroll.newInstance(sysContext);
+        pad(scroll, 18, 12, 18, 12);
+        bg(scroll, C_SURFACE, C_BORDER, 1f, 14f);
+        Object bodyTv = text("", 15f, C_TEXT, false);
+        add(scroll, bodyTv, ctorFlLp2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+        add(page, scroll, margins(lpw(MATCH_PARENT, 0, 1f), 0, 8, 0, 0));
+        historyBodyTv = bodyTv;
+        return page;
+    }
+
+    /** ◀ [session label] ▶ (+ USB export). Returns the label TextView. */
+    private static Object buildSessionNavRow(Object parent, boolean withExport) throws Exception {
+        Object row = hbox();
+        Object prev = button("◀  이전", 15f, new Runnable() {
             @Override
             public void run() {
                 AuxMonMain.selectAdjacentSession(-1);
                 refreshOnUiThread();
             }
         });
-        Object prevLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(prevLp, 10, 0, 4, 0);
-        addView.invoke(ctrlRow, prevSessBtn, prevLp);
-
-        Object sessTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(sessTv, "현재 세션 (1/1)", 12.0f, 0xFFE2E8F0, true);
-        setPad.invoke(sessTv, 6, 0, 6, 0);
-        addView.invoke(ctrlRow, sessTv, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
-
-        Object nextSessBtn = createChipButton(tvCtor, setPad, "▶", 0xFF1E293B, 0xFF334155, 0xFFCBD5E1, new Runnable() {
+        add(row, prev, lp(WRAP_CONTENT, WRAP_CONTENT));
+        Object label = text("기록 없음", 15f, C_TEXT, true);
+        mTvSetGravity.invoke(label, GRAVITY_CENTER);
+        maxLines(label, 1);
+        add(row, label, margins(lpw(0, WRAP_CONTENT, 1f), 10, 0, 10, 0));
+        Object next = button("다음  ▶", 15f, new Runnable() {
             @Override
             public void run() {
                 AuxMonMain.selectAdjacentSession(1);
                 refreshOnUiThread();
             }
         });
-        Object nextLp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(nextLp, 4, 0, 0, 0);
-        addView.invoke(ctrlRow, nextSessBtn, nextLp);
+        add(row, next, lp(WRAP_CONTENT, WRAP_CONTENT));
+        if (withExport) {
+            Object export = button("💾  USB로 내보내기", 15f, new Runnable() {
+                @Override
+                public void run() {
+                    AuxMonMain.exportToUsbAsync();
+                    refreshOnUiThread();
+                }
+            });
+            add(row, export, margins(lp(WRAP_CONTENT, WRAP_CONTENT), 10, 0, 0, 0));
+        }
+        add(parent, row, lp(MATCH_PARENT, WRAP_CONTENT));
+        return label;
+    }
 
-        addView.invoke(expBox, ctrlRow, ctrlRowLp);
+    // ---- Tab 4: settings ----------------------------------------------------
 
-        // --- Row C: 4 KPI Metric Cards ---
-        Object kpiRow = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(kpiRow, 0);
-        Object kpiRowLp = llLpCtor2.newInstance(CARD_WIDTH, WRAP_CONTENT);
-        setMargins(kpiRowLp, 0, 0, 0, 8);
+    private static Object buildSettingsPage() throws Exception {
+        Object scroll = ctorScroll.newInstance(sysContext);
+        Object list = vbox();
 
-        Object[] card1 = buildKpiCard(llCtor, tvCtor, addView, setPad, llLpCtor2,
-                "12V 보조배터리 전압", "12.60 V", "최저 -V / 최고 -V", 0xFF38BDF8);
-        Object[] card2 = buildKpiCard(llCtor, tvCtor, addView, setPad, llLpCtor2,
-                "보조배터리 충전율 (SOC)", "85 %", "시작 85% → 현재 85%", 0xFFA7F3D0);
-        Object[] card3 = buildKpiCard(llCtor, tvCtor, addView, setPad, llLpCtor2,
-                "주차 중 충전 진행 횟수", "0 회 충전", "누적 충전: 00:00:00", 0xFF10B981);
-        Object[] card4 = buildKpiCard(llCtor, tvCtor, addView, setPad, llLpCtor2,
-                "주차 경과 / 목표 시간", "00:00:00", "목표: 6시간 (PwrKeep 대기)", 0xFFFBBF24);
-
-        Object c1Lp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-        setMargins(c1Lp, 0, 0, 6, 0);
-        Object c2Lp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-        setMargins(c2Lp, 0, 0, 6, 0);
-        Object c3Lp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-        setMargins(c3Lp, 0, 0, 6, 0);
-        Object c4Lp = llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f);
-
-        addView.invoke(kpiRow, card1[0], c1Lp);
-        addView.invoke(kpiRow, card2[0], c2Lp);
-        addView.invoke(kpiRow, card3[0], c3Lp);
-        addView.invoke(kpiRow, card4[0], c4Lp);
-        addView.invoke(expBox, kpiRow, kpiRowLp);
-
-        // --- Row D: Time-Series Voltage & IG3 Charging Graph Box ---
-        Object chartBox = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(chartBox, 1);
-        setPad.invoke(chartBox, 14, 8, 14, 8);
-        setRoundedBg(chartBox, 0xFF0D1524, 0xFF1E293B, 1, 10f);
-        Object chartBoxLp = llLpCtor2.newInstance(CARD_WIDTH, WRAP_CONTENT);
-        setMargins(chartBoxLp, 0, 0, 0, 8);
-
-        Object chartIv = ivCtor.newInstance(sysContext);
-        Object fitXy = scaleTypeCls.getField("FIT_XY").get(null);
-        ivCls.getMethod("setScaleType", scaleTypeCls).invoke(chartIv, fitXy);
-        addView.invoke(chartBox, chartIv, llLpCtor2.newInstance(CHART_WIDTH, CHART_HEIGHT));
-        addView.invoke(expBox, chartBox, chartBoxLp);
-
-        // --- Row E: Charging Event History & Voltage Log Box ---
-        Object logBox = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(logBox, 1);
-        setPad.invoke(logBox, 12, 8, 12, 8);
-        setRoundedBg(logBox, 0xFF0E1726, 0xFF1E293B, 1, 10f);
-        Object logBoxLp = llLpCtor2.newInstance(CARD_WIDTH, WRAP_CONTENT);
-        setMargins(logBoxLp, 0, 0, 0, 8);
-
-        Object logHdrTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(logHdrTv, "⚡ 주차 중 보조배터리 자동충전 이력 및 시간대별 전압 기록", 12.5f, 0xFF38BDF8, true);
-        addView.invoke(logBox, logHdrTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-        Object logBodyTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(logBodyTv, "주차 감시가 시작되면 충전 이력(#1, #2...)과 전압 추이가 여기에 표시됩니다.", 11.5f, 0xFFCBD5E1, false);
-        Object logBodyLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
-        setMargins(logBodyLp, 0, 4, 0, 0);
-        addView.invoke(logBox, logBodyTv, logBodyLp);
-
-        addView.invoke(expBox, logBox, logBoxLp);
-
-        // --- Row F: Action Buttons (Start/Stop, Manual IG3 Test, Demo Sim, USB Export) ---
-        Object actRow = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(actRow, 0);
-        setGravity.invoke(actRow, 16);
-        Object actRowLp = llLpCtor2.newInstance(CARD_WIDTH, WRAP_CONTENT);
-        setMargins(actRowLp, 0, 0, 0, 6);
-
-        Object startStopBtn = createChipButton(tvCtor, setPad, "▶ 주차기록 지금 시작", 0xFF0F2942, 0xFF0EA5E9, 0xFF38BDF8, new Runnable() {
+        // 1. Keep duration
+        Object s1 = settingSection(list, "절전 유지 시간",
+                "시동을 끈 뒤 헤드유닛 전원을 얼마나 유지할지 정합니다. 배터리 보호 조건에 걸리면 시간과 관계없이 꺼집니다.");
+        Object hoursRow = hbox();
+        for (int i = 0; i < HOUR_PRESETS.length; i++) {
+            final int h = HOUR_PRESETS[i];
+            Object chip = button(h == 0 ? "상시" : (h + "시간"), 15f, new Runnable() {
+                @Override
+                public void run() {
+                    AuxMonMain.setTargetParkingHoursFromUi(h);
+                    refreshOnUiThread();
+                }
+            });
+            add(hoursRow, chip, margins(lp(WRAP_CONTENT, WRAP_CONTENT), 0, 0, 8, 0));
+            hourChips[i] = chip;
+        }
+        add(s1, hoursRow, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 10, 0, 0));
+        Object fineRow = hbox();
+        add(fineRow, text("세부 조절", 14f, C_TEXT_SUB, true), margins(lp(WRAP_CONTENT, WRAP_CONTENT), 0, 0, 12, 0));
+        add(fineRow, button("−  1시간", 15f, new Runnable() {
             @Override
             public void run() {
-                AuxMonMain.toggleManualParkingSession();
+                AuxMonMain.adjustTargetParkingHours(-1);
                 refreshOnUiThread();
             }
-        });
-        tvSetGravity.invoke(startStopBtn, 17);
-        Object b1Lp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(b1Lp, 0, 0, 8, 0);
-        addView.invoke(actRow, startStopBtn, b1Lp);
+        }), lp(WRAP_CONTENT, WRAP_CONTENT));
+        hourValueTv = text("상시", 17f, C_BLUE, true);
+        mTvSetGravity.invoke(hourValueTv, GRAVITY_CENTER);
+        add(fineRow, hourValueTv, margins(lp(dp(120), WRAP_CONTENT), 8, 0, 8, 0));
+        add(fineRow, button("+  1시간", 15f, new Runnable() {
+            @Override
+            public void run() {
+                AuxMonMain.adjustTargetParkingHours(1);
+                refreshOnUiThread();
+            }
+        }), lp(WRAP_CONTENT, WRAP_CONTENT));
+        add(s1, fineRow, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 10, 0, 0));
 
-        Object ig3TestBtn = createChipButton(tvCtor, setPad, "⚡ IG3 수동충전 테스트: OFF", 0xFF1E293B, 0xFF475569, 0xFFE2E8F0, new Runnable() {
+        // 2. Sample interval
+        Object s2 = settingSection(list, "기록 간격",
+                "주차 중 전압과 충전 상태를 저장하는 간격입니다. 짧을수록 자세하지만 차량 통신과 저장 공간을 더 씁니다.");
+        Object intRow = hbox();
+        for (int i = 0; i < INTERVAL_PRESETS.length; i++) {
+            final int sec = INTERVAL_PRESETS[i];
+            Object chip = button(sec + "초", 15f, new Runnable() {
+                @Override
+                public void run() {
+                    AuxMonMain.setSampleIntervalSecFromUi(sec);
+                    refreshOnUiThread();
+                }
+            });
+            add(intRow, chip, margins(lp(dp(110), WRAP_CONTENT), 0, 0, 8, 0));
+            intervalChips[i] = chip;
+        }
+        add(s2, intRow, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 10, 0, 0));
+
+        // 3. Auto-charge mode
+        Object s3 = settingSection(list, "자동 충전 방식", null);
+        modeDescTv = text("", 14f, C_TEXT_SUB, false);
+        add(s3, modeDescTv, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 2, 0, 0));
+        Object modeRow = hbox();
+        final int[] modes = new int[]{AuxMonModels.MODE_PASSIVE_OBSERVE, AuxMonModels.MODE_ACTIVE_1H_IG3};
+        final String[] modeLabels = new String[]{"차량 기본 동작만 기록", "1시간마다 충전 요청"};
+        for (int i = 0; i < modes.length; i++) {
+            final int m = modes[i];
+            Object chip = button(modeLabels[i], 15f, new Runnable() {
+                @Override
+                public void run() {
+                    AuxMonMain.setAutoChargeModeFromUi(m);
+                    refreshOnUiThread();
+                }
+            });
+            add(modeRow, chip, margins(lp(WRAP_CONTENT, WRAP_CONTENT), 0, 0, 8, 0));
+            modeChips[i] = chip;
+        }
+        add(s3, modeRow, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 10, 0, 0));
+
+        // 4. Test tools
+        Object s4 = settingSection(list, "점검 도구",
+                "실차 점검용 기능입니다. IG3 충전 테스트는 차량에 보조배터리 충전을 직접 요청합니다.");
+        Object toolRow = hbox();
+        ig3TestBtnTv = button("⚡  IG3 충전 테스트 시작", 15f, new Runnable() {
             @Override
             public void run() {
                 AuxMonMain.toggleManualIg3Test();
                 refreshOnUiThread();
             }
         });
-        tvSetGravity.invoke(ig3TestBtn, 17);
-        Object b2Lp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(b2Lp, 0, 0, 8, 0);
-        addView.invoke(actRow, ig3TestBtn, b2Lp);
-
-        Object demoBtn = createChipButton(tvCtor, setPad, "🧪 시뮬레이션 기록 생성", 0xFF1E1B4B, 0xFF6366F1, 0xFFC7D2FE, new Runnable() {
+        add(toolRow, ig3TestBtnTv, margins(lp(WRAP_CONTENT, WRAP_CONTENT), 0, 0, 8, 0));
+        add(toolRow, button("📋  샘플 기록 만들기", 15f, new Runnable() {
             @Override
             public void run() {
                 AuxMonMain.loadDemoParkingSession();
                 refreshOnUiThread();
             }
-        });
-        tvSetGravity.invoke(demoBtn, 17);
-        Object b3Lp = llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT);
-        setMargins(b3Lp, 0, 0, 8, 0);
-        addView.invoke(actRow, demoBtn, b3Lp);
+        }), lp(WRAP_CONTENT, WRAP_CONTENT));
+        add(s4, toolRow, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 10, 0, 0));
 
-        Object exportBtn = createChipButton(tvCtor, setPad, "💾 데이터 내보내기 (USB 저장)", 0xFF064E3B, 0xFF10B981, 0xFFA7F3D0, new Runnable() {
-            @Override
-            public void run() {
-                AuxMonMain.exportToUsbAsync();
-                refreshOnUiThread();
+        add(scroll, list, ctorFlLp2.newInstance(MATCH_PARENT, WRAP_CONTENT));
+        return scroll;
+    }
+
+    private static Object settingSection(Object list, String title, String desc) throws Exception {
+        Object sec = vbox();
+        pad(sec, 18, 14, 18, 14);
+        bg(sec, C_SURFACE, C_BORDER, 1f, 14f);
+        add(sec, text(title, 18f, C_TEXT, true), lp(MATCH_PARENT, WRAP_CONTENT));
+        if (desc != null) {
+            add(sec, text(desc, 14f, C_TEXT_SUB, false), margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 2, 0, 0));
+        }
+        add(list, sec, margins(lp(MATCH_PARENT, WRAP_CONTENT), 0, 0, 0, 10));
+        return sec;
+    }
+
+    // ========================================================================
+    // ACTIONS
+    // ========================================================================
+
+    private static void onPrimaryButton() {
+        long nowRt = AuxMonModels.elapsedRealtimeMs();
+        if (AuxMonMain.isCurrentlyMonitoringParking()) {
+            if (nowRt < stopConfirmUntilRt) {
+                stopConfirmUntilRt = 0L;
+                AuxMonMain.stopActiveParkingSessionManual();
+            } else {
+                // Stopping while parked powers the headunit off immediately -> require a second tap
+                stopConfirmUntilRt = nowRt + STOP_CONFIRM_WINDOW_MS;
+                postDelayedToUi(REFRESH_UI_TASK, STOP_CONFIRM_WINDOW_MS + 100L);
             }
-        });
-        tvSetGravity.invoke(exportBtn, 17);
-        addView.invoke(actRow, exportBtn, llLpCtor3.newInstance(0, WRAP_CONTENT, 1.0f));
-
-        addView.invoke(expBox, actRow, actRowLp);
-
-        // --- Row G: Bottom Status / Export Result Banner ---
-        Object noticeTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(noticeTv, "💡 시동이 꺼지면(ACC/IGN OFF) 자동으로 설정된 n시간 동안 헤드유닛 절전 전원을 유지하며 보조배터리 전압과 충전 횟수를 기록합니다.", 11.5f, 0xFFFBBF24, true);
-        addView.invoke(expBox, noticeTv, llLpCtor2.newInstance(CARD_WIDTH, WRAP_CONTENT));
-
-        attachDragOnlyListener(expBox);
-        addView.invoke(root, expBox, llLpCtor2.newInstance(WRAP_CONTENT, WRAP_CONTENT));
-
-        // Bind static references
-        compactRowView = compactRow;
-        compactTextView = cTv;
-        expandedBoxView = expBox;
-        badgeTextView = badgeTv;
-        nHoursValueTv = nValTv;
-        sampleIntervalBtnTv = smpBtn;
-        modeBtnTv = modeBtn;
-        sessionNavTv = sessTv;
-
-        kpiVoltMainTv = card1[1];
-        kpiVoltSubTv = card1[2];
-        kpiSocMainTv = card2[1];
-        kpiSocSubTv = card2[2];
-        kpiChgMainTv = card3[1];
-        kpiChgSubTv = card3[2];
-        kpiTimeMainTv = card4[1];
-        kpiTimeSubTv = card4[2];
-
-        chartImageView = chartIv;
-        chargeHistoryHeaderTv = logHdrTv;
-        chargeHistoryBodyTv = logBodyTv;
-
-        startStopParkingBtnTv = startStopBtn;
-        manualIg3BtnTv = ig3TestBtn;
-        exportUsbBtnTv = exportBtn;
-        bottomNoticeTv = noticeTv;
-
-        return root;
+        } else {
+            stopConfirmUntilRt = 0L;
+            AuxMonMain.toggleManualParkingSession();
+        }
+        refreshOnUiThread();
     }
 
-    private static Object[] buildKpiCard(
-            Constructor<?> llCtor,
-            Constructor<?> tvCtor,
-            Method addView,
-            Method setPad,
-            Constructor<?> llLpCtor2,
-            String label,
-            String mainVal,
-            String subVal,
-            int mainColor) throws Exception {
-        final int MATCH_PARENT = -1;
-        final int WRAP_CONTENT = -2;
-        Class<?> llCls = Class.forName("android.widget.LinearLayout");
-
-        Object card = llCtor.newInstance(sysContext);
-        llCls.getMethod("setOrientation", int.class).invoke(card, 1);
-        setPad.invoke(card, 12, 8, 12, 8);
-        setRoundedBg(card, 0xFF111C2D, 0xFF1E293B, 1, 10f);
-
-        Object lblTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(lblTv, label, 11.5f, 0xFF94A3B8, true);
-        addView.invoke(card, lblTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-        Object mainTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(mainTv, mainVal, 18.0f, mainColor, true);
-        Object mainLp = llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT);
-        setMargins(mainLp, 0, 2, 0, 2);
-        addView.invoke(card, mainTv, mainLp);
-
-        Object subTv = tvCtor.newInstance(sysContext);
-        setTextViewStyle(subTv, subVal, 11.0f, 0xFFCBD5E1, false);
-        addView.invoke(card, subTv, llLpCtor2.newInstance(MATCH_PARENT, WRAP_CONTENT));
-
-        return new Object[]{card, mainTv, subTv};
+    private static void selectTabOnUiThread(int idx) {
+        currentTab = idx;
+        selectTabViews(idx);
+        refreshOnUiThread();
+        // The chart is sized from the ImageView after layout; redraw once the new page is measured.
+        postDelayedToUi(REFRESH_UI_TASK, 120L);
     }
 
-    private static Object createChipButton(
-            Constructor<?> tvCtor,
-            Method setPad,
-            String text,
-            int bgColor,
-            int borderColor,
-            int textColor,
-            Runnable clickAction) throws Exception {
-        Object btn = tvCtor.newInstance(sysContext);
-        setTextViewStyle(btn, text, 12.0f, textColor, true);
-        setPad.invoke(btn, 12, 6, 12, 6);
-        setRoundedBg(btn, bgColor, borderColor, 1, 8f);
-        attachButtonOrDragListener(btn, clickAction);
-        return btn;
+    private static void selectTabViews(int idx) {
+        for (int i = 0; i < tabPages.length; i++) {
+            vis(tabPages[i], i == idx);
+            Object tab = tabButtons[i];
+            if (tab == null) continue;
+            if (i == idx) {
+                bg(tab, C_BLUE, C_BLUE, 1f, 12f);
+                setColor(tab, C_ON_ACCENT);
+            } else {
+                bg(tab, C_SURFACE, C_BORDER, 1f, 12f);
+                setColor(tab, C_TEXT_SUB);
+            }
+        }
     }
 
-    private static void applyModeVisibilityOnUiThread() {
+    // ========================================================================
+    // WINDOW MANAGEMENT
+    // ========================================================================
+
+    private static int[] getDisplaySizePx() {
         try {
-            Class<?> viewCls = Class.forName("android.view.View");
-            Method setVis = viewCls.getMethod("setVisibility", int.class);
-            if (compactRowView != null) {
-                setVis.invoke(compactRowView, compactMode ? 0 : 8);
+            Object display = windowManager.getClass().getMethod("getDefaultDisplay").invoke(windowManager);
+            Class<?> pointCls = Class.forName("android.graphics.Point");
+            Object pt = pointCls.getConstructor().newInstance();
+            try {
+                display.getClass().getMethod("getRealSize", pointCls).invoke(display, pt);
+            } catch (Throwable t) {
+                display.getClass().getMethod("getSize", pointCls).invoke(display, pt);
             }
-            if (expandedBoxView != null) {
-                setVis.invoke(expandedBoxView, compactMode ? 8 : 0);
+            int w = pointCls.getField("x").getInt(pt);
+            int h = pointCls.getField("y").getInt(pt);
+            if (w > 0 && h > 0) {
+                return new int[]{w, h};
             }
         } catch (Throwable ignored) {
+        }
+        return null;
+    }
+
+    private static void configureWmLp(Object wmLp) throws Exception {
+        Class<?> wmLpCls = Class.forName("android.view.WindowManager$LayoutParams");
+        wmLpCls.getField("gravity").setInt(wmLp, GRAVITY_TOP_LEFT);
+        if (compactMode) {
+            wmLpCls.getField("width").setInt(wmLp, WRAP_CONTENT);
+            wmLpCls.getField("height").setInt(wmLp, WRAP_CONTENT);
+            wmLpCls.getField("flags").setInt(wmLp, FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL | FLAG_LAYOUT_IN_SCREEN);
+            wmLpCls.getField("x").setInt(wmLp, winX);
+            wmLpCls.getField("y").setInt(wmLp, winY);
+        } else {
+            int[] size = getDisplaySizePx();
+            wmLpCls.getField("width").setInt(wmLp, size != null ? size[0] : MATCH_PARENT);
+            wmLpCls.getField("height").setInt(wmLp, size != null ? size[1] : MATCH_PARENT);
+            wmLpCls.getField("flags").setInt(wmLp,
+                    FLAG_NOT_FOCUSABLE | FLAG_LAYOUT_IN_SCREEN | FLAG_LAYOUT_NO_LIMITS | FLAG_FULLSCREEN);
+            wmLpCls.getField("x").setInt(wmLp, 0);
+            wmLpCls.getField("y").setInt(wmLp, 0);
+        }
+    }
+
+    private static void applyRootStyle() {
+        if (compactMode) {
+            bg(rootOverlayView, 0xF2121B2D, C_BLUE, 2f, 14f);
+        } else {
+            bg(rootOverlayView, C_BG, C_BG, 0f, 0f);
+        }
+    }
+
+    private static void setCompactModeOnUiThread(boolean compact) {
+        compactMode = compact;
+        stopConfirmUntilRt = 0L;
+        vis(compactRowView, compact);
+        vis(fullBoxView, !compact);
+        applyRootStyle();
+        Object root = rootOverlayView;
+        Object lp = currentWmLp;
+        if (root != null && lp != null && windowManager != null) {
+            try {
+                configureWmLp(lp);
+                Class<?> vgLpCls = Class.forName("android.view.ViewGroup$LayoutParams");
+                Class<?> vmCls = Class.forName("android.view.ViewManager");
+                vmCls.getMethod("updateViewLayout", cView, vgLpCls).invoke(windowManager, root, lp);
+            } catch (Throwable t) {
+                System.out.println("[AuxMon] updateViewLayout failed: " + t);
+            }
+        }
+        refreshOnUiThread();
+        if (!compact) {
+            postDelayedToUi(REFRESH_UI_TASK, 120L);
         }
     }
 
@@ -682,8 +1077,7 @@ public final class AuxMonOverlay {
                 return;
             }
             if (isVisible && rootOverlayView != null) {
-                applyModeVisibilityOnUiThread();
-                refreshOnUiThread();
+                setCompactModeOnUiThread(compactMode);
                 return;
             }
 
@@ -693,7 +1087,6 @@ public final class AuxMonOverlay {
             Class<?> vmCls = Class.forName("android.view.ViewManager");
 
             int[] candidateTypes = new int[]{2020, 2008, 2009, 2005};
-            int flags = 0x00000008 | 0x00000020; // FLAG_NOT_FOCUSABLE | FLAG_NOT_TOUCH_MODAL
             Constructor<?> wmLpCtor = wmLpCls.getConstructor(int.class, int.class, int.class, int.class, int.class);
             Method addViewMethod = vmCls.getMethod("addView", viewCls, vgLpCls);
 
@@ -703,12 +1096,12 @@ public final class AuxMonOverlay {
                 try {
                     candidateRoot = buildOverlayViewTree();
                     rootOverlayView = candidateRoot;
-                    applyModeVisibilityOnUiThread();
+                    vis(compactRowView, compactMode);
+                    vis(fullBoxView, !compactMode);
+                    applyRootStyle();
 
-                    Object wmLp = wmLpCtor.newInstance(-2, -2, wtype, flags, -3);
-                    wmLpCls.getField("gravity").setInt(wmLp, 51); // TOP | LEFT
-                    wmLpCls.getField("x").setInt(wmLp, winX);
-                    wmLpCls.getField("y").setInt(wmLp, winY);
+                    Object wmLp = wmLpCtor.newInstance(WRAP_CONTENT, WRAP_CONTENT, wtype, FLAG_NOT_FOCUSABLE, PIXEL_FORMAT_TRANSLUCENT);
+                    configureWmLp(wmLp);
                     wmLpCls.getMethod("setTitle", CharSequence.class).invoke(wmLp, "HKGAuxMonOverlay");
 
                     addViewMethod.invoke(windowManager, candidateRoot, wmLp);
@@ -726,10 +1119,12 @@ public final class AuxMonOverlay {
                     currentWmLp = wmLp;
                     hiddenForRearCam = false;
                     isVisible = true;
-                    System.out.println("[AuxMon] Overlay displayed (wtype=" + wtype + ", x=" + winX + ", y=" + winY + ")");
+                    System.out.println("[AuxMon] Overlay displayed (wtype=" + wtype + ", compact=" + compactMode + ")");
                     refreshOnUiThread();
+                    postDelayedToUi(REFRESH_UI_TASK, 150L);
                     break;
                 } catch (Throwable t) {
+                    rootOverlayView = null;
                     if (candidateRoot != null) {
                         try {
                             windowManager.getClass().getMethod("removeViewImmediate", viewCls).invoke(windowManager, candidateRoot);
@@ -750,12 +1145,13 @@ public final class AuxMonOverlay {
         rootOverlayView = null;
         currentWmLp = null;
         isVisible = false;
+        stopConfirmUntilRt = 0L;
         try {
             if (oldRoot != null && windowManager != null) {
                 Class<?> viewCls = Class.forName("android.view.View");
                 Class<?> vmCls = Class.forName("android.view.ViewManager");
                 try {
-                    viewCls.getMethod("setVisibility", int.class).invoke(oldRoot, 8);
+                    viewCls.getMethod("setVisibility", int.class).invoke(oldRoot, GONE);
                 } catch (Throwable ignored) {
                 }
                 try {
@@ -766,7 +1162,33 @@ public final class AuxMonOverlay {
             }
         } catch (Throwable ignored) {
         }
+        bgCache.clear();
     }
+
+    private static void updateWindowPositionOnUiThread(int newX, int newY) {
+        Object root = rootOverlayView;
+        Object lp = currentWmLp;
+        if (root == null || lp == null || windowManager == null || !compactMode) return;
+        try {
+            int[] size = getDisplaySizePx();
+            int maxX = (size != null) ? Math.max(0, size[0] - dp(120)) : 1800;
+            int maxY = (size != null) ? Math.max(0, size[1] - dp(48)) : 660;
+            winX = Math.max(0, Math.min(maxX, newX));
+            winY = Math.max(0, Math.min(maxY, newY));
+
+            Class<?> wmLpCls = Class.forName("android.view.WindowManager$LayoutParams");
+            wmLpCls.getField("x").setInt(lp, winX);
+            wmLpCls.getField("y").setInt(lp, winY);
+            Class<?> vgLpCls = Class.forName("android.view.ViewGroup$LayoutParams");
+            Class<?> vmCls = Class.forName("android.view.ViewManager");
+            vmCls.getMethod("updateViewLayout", cView, vgLpCls).invoke(windowManager, root, lp);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    // ========================================================================
+    // REFRESH
+    // ========================================================================
 
     private static void refreshOnUiThread() {
         if (!isVisible || rootOverlayView == null) return;
@@ -774,260 +1196,394 @@ public final class AuxMonOverlay {
 
         try {
             boolean rearCamOpen = "1".equals(AuxMonMain.getSystemProperty("persist.sys.rearcam.open", "0"));
-            Class<?> viewCls = Class.forName("android.view.View");
             if (rearCamOpen) {
                 if (!hiddenForRearCam) {
                     hiddenForRearCam = true;
-                    viewCls.getMethod("setVisibility", int.class).invoke(rootOverlayView, 8);
+                    vis(rootOverlayView, false);
                 }
                 postDelayedToUi(REFRESH_UI_TASK, 500L);
                 return;
             } else if (hiddenForRearCam) {
                 hiddenForRearCam = false;
-                viewCls.getMethod("setVisibility", int.class).invoke(rootOverlayView, 0);
+                vis(rootOverlayView, true);
             }
 
-            ParkingSession sess = AuxMonMain.getDisplayedSession();
-            LiveTelemetrySnapshot live = AuxMonMain.getLatestLiveSnapshot();
-            int targetHours = AuxMonMain.getConfiguredTargetHours();
-            int sampleSec = AuxMonMain.getConfiguredSampleIntervalSec();
-            int autoMode = AuxMonMain.getConfiguredAutoChargeMode();
-
-            boolean chargingNow = (live != null && live.isChargingActive())
-                    || (sess != null && sess.getOngoingChargeEvent() != null);
-
-            int borderColor = 0xFF38BDF8;
-            int badgeBg = 0xFF38BDF8;
-            String badgeStr = "주행/대기 중";
-
-            if (chargingNow) {
-                borderColor = 0xFF10B981;
-                badgeBg = 0xFF10B981;
-                badgeStr = "⚡ IG3 자동충전 중";
-            } else if (sess != null && sess.status == AuxMonModels.SESSION_MONITORING_PARKING) {
-                borderColor = 0xFF0EA5E9;
-                badgeBg = 0xFF0EA5E9;
-                badgeStr = "주차 절전유지 (" + AuxMonModels.formatTargetHoursLabel(sess.targetParkingHours) + ")";
-            } else if (sess != null && sess.status == AuxMonModels.SESSION_COMPLETED_N_HOURS) {
-                borderColor = 0xFF10B981;
-                badgeBg = 0xFF10B981;
-                badgeStr = AuxMonModels.formatTargetHoursLabel(sess.targetParkingHours) + " 완료 ✓";
-            } else if (sess != null && sess.status == AuxMonModels.SESSION_SAFETY_CUTOFF) {
-                borderColor = 0xFFEF4444;
-                badgeBg = 0xFFEF4444;
-                badgeStr = "방전보호 차단됨";
-            }
-
-            if (borderColor != lastBorderColor) {
-                lastBorderColor = borderColor;
-                setRoundedBg(rootOverlayView, 0xF40B111E, borderColor, 2, 16f);
-            }
-
-            Class<?> tvCls = Class.forName("android.widget.TextView");
-            Method setText = tvCls.getMethod("setText", CharSequence.class);
-            Method setTextColor = tvCls.getMethod("setTextColor", int.class);
-
-            float dispVolt = (sess != null && !sess.samples.isEmpty()) ? sess.latestVoltageV : (live != null ? live.voltageV : 0.0f);
-            int dispSoc = (sess != null && !sess.samples.isEmpty()) ? sess.latestSocPct : (live != null ? live.socPct : -1);
-            int chgCount = (sess != null) ? sess.getChargeCount() : 0;
-            long elapsedSec = (sess != null) ? sess.getElapsedParkingSec() : 0L;
-
-            if (compactMode && compactTextView != null) {
-                String voltTxt = dispVolt > 1.0f ? String.format(Locale.US, "%.2fV", Float.valueOf(dispVolt)) : "--V";
-                String cText = String.format(Locale.US,
-                        "🔋 12V %s (%s)  |  주차 %s (%s)  |  충전 %d회  %s  (터치하여 패널 열기)",
-                        voltTxt,
-                        AuxMonModels.formatSocPct(dispSoc),
-                        AuxMonModels.formatDurationHms(elapsedSec),
-                        AuxMonModels.formatTargetHoursLabel(sess != null ? sess.targetParkingHours : targetHours),
-                        Integer.valueOf(chgCount),
-                        chargingNow ? "• ⚡ IG3 충전중" : "");
-                setText.invoke(compactTextView, cText);
+            UiState st = UiState.capture();
+            if (compactMode) {
+                refreshCompact(st);
             } else {
-                setText.invoke(badgeTextView, badgeStr);
-                setRoundedBg(badgeTextView, badgeBg, badgeBg, 0, 10f);
-
-                setText.invoke(nHoursValueTv, AuxMonModels.formatTargetHoursLabel(targetHours));
-                if (sampleIntervalBtnTv != null) {
-                    setText.invoke(sampleIntervalBtnTv, "주기: " + sampleSec + "s");
+                refreshHero(st);
+                switch (currentTab) {
+                    case TAB_OVERVIEW:
+                        refreshOverview(st);
+                        break;
+                    case TAB_CHART:
+                        refreshSessionNav(chartNavTv, st.displayed);
+                        renderVoltageChartOnUiThread(st.displayed, st.targetHours);
+                        break;
+                    case TAB_HISTORY:
+                        refreshSessionNav(historyNavTv, st.displayed);
+                        setText(historyBodyTv, buildHistoryText(st.displayed));
+                        break;
+                    case TAB_SETTINGS:
+                        refreshSettings(st);
+                        break;
+                    default:
+                        break;
                 }
-                if (autoMode == AuxMonModels.MODE_ACTIVE_1H_IG3) {
-                    setText.invoke(modeBtnTv, "모드: 1시간 주기 IG3 강제충전");
-                    setRoundedBg(modeBtnTv, 0xFF064E3B, 0xFF10B981, 1, 8f);
-                    setTextColor.invoke(modeBtnTv, 0xFFA7F3D0);
-                } else {
-                    setText.invoke(modeBtnTv, "모드: 순정 Aux. Battery Saver+ 감시");
-                    setRoundedBg(modeBtnTv, 0xFF172554, 0xFF3B82F6, 1, 8f);
-                    setTextColor.invoke(modeBtnTv, 0xFF93C5FD);
-                }
-
-                setText.invoke(sessionNavTv, AuxMonMain.getSessionNavLabel());
-
-                // KPI Card 1: Voltage (explicitly mark estimated vs measured)
-                String vSrc = (live != null) ? live.voltageSource : "SOC_EST(추정)";
-                boolean isEst = (live == null || !live.isDirectVoltageMeasured());
-                if (dispVolt > 1.0f) {
-                    setText.invoke(kpiVoltMainTv, String.format(Locale.US, "%.2f V%s",
-                            Float.valueOf(dispVolt), isEst ? " (추정)" : ""));
-                } else {
-                    setText.invoke(kpiVoltMainTv, "--.-- V (미확인)");
-                }
-                if (sess != null && !sess.samples.isEmpty() && sess.maxVoltageV > 1.0f) {
-                    float minV = sess.minVoltageV > 50f ? dispVolt : sess.minVoltageV;
-                    setText.invoke(kpiVoltSubTv, String.format(Locale.US,
-                            "최저 %.2fV / 최고 %.2fV (%s)",
-                            Float.valueOf(minV), Float.valueOf(sess.maxVoltageV), vSrc));
-                } else {
-                    setText.invoke(kpiVoltSubTv, "전압 소스: " + vSrc);
-                }
-
-                // KPI Card 2: SOC & BatSocStatus_M (no fake 85%, no bogus Solar Roof LDC W)
-                setText.invoke(kpiSocMainTv, AuxMonModels.formatSocPct(dispSoc));
-                String socFlagStr = (live != null && live.batSocStatusFlag == 1) ? "비정상(UNNORMAL)" : "정상";
-                if (sess != null && !sess.samples.isEmpty()) {
-                    setText.invoke(kpiSocSubTv, String.format(Locale.US,
-                            "시작 %s → 현재 %s | 상태:%s",
-                            AuxMonModels.formatSocPct(sess.startSocPct),
-                            AuxMonModels.formatSocPct(dispSoc),
-                            socFlagStr));
-                } else {
-                    setText.invoke(kpiSocSubTv, "12V 배터리 SOC | 상태: " + socFlagStr);
-                }
-
-                // KPI Card 3: Charge Count & IG3 / Relay Mode
-                setText.invoke(kpiChgMainTv, "총 " + chgCount + " 회 충전");
-                long totalChgSec = (sess != null) ? sess.getTotalChargeDurationSec() : 0L;
-                boolean ig3State = (live != null && live.ig3On);
-                int rlyMode = (live != null) ? live.ig3RlyMode : 0;
-                setText.invoke(kpiChgSubTv, String.format(Locale.US,
-                        "누적 %s | IG3:%s (Rly:%d)",
-                        AuxMonModels.formatDurationHms(totalChgSec),
-                        ig3State ? "ON⚡" : "OFF",
-                        Integer.valueOf(rlyMode)));
-
-                // KPI Card 4: Parking Elapsed / Target Hours & Safety Status
-                int sessHours = (sess != null) ? sess.targetParkingHours : targetHours;
-                if (sessHours <= 0) {
-                    setText.invoke(kpiTimeMainTv, AuxMonModels.formatDurationHms(elapsedSec) + " (상시)");
-                } else {
-                    int pct = (sess != null) ? sess.getProgressPercent() : 0;
-                    setText.invoke(kpiTimeMainTv, AuxMonModels.formatDurationHms(elapsedSec) + " (" + pct + "%)");
-                }
-                String pwrKeepStr = HkmcVehicleBridge.isKeepAliveActive() ? "PwrKeep:ON(60s재전송)" : "PwrKeep:대기";
-                String alarmStr = "보호:정상";
-                if (live != null) {
-                    if (live.autoCutPreWrng > 0 || live.batEvtAlarm > 0) {
-                        alarmStr = "방전경보:" + live.batEvtAlarm + "/차단:" + live.autoCutPreWrng;
-                    } else if (live.battMngAlert > 0) {
-                        alarmStr = "등화경고(비상등/미등):" + live.battMngAlert;
-                    }
-                }
-                setText.invoke(kpiTimeSubTv, "목표 " + AuxMonModels.formatTargetHoursLabel(sessHours) + " | " + pwrKeepStr + " | " + alarmStr);
-
-                // Render Canvas Chart
-                renderVoltageChartOnUiThread(sess, live, targetHours);
-
-                // Update Charge Event History & Log Box
-                updateChargeHistoryTextOnUiThread(setText, sess);
-
-                // Update Action Buttons
-                boolean activeMonitoring = AuxMonMain.isCurrentlyMonitoringParking();
-                if (activeMonitoring) {
-                    setText.invoke(startStopParkingBtnTv, "■ 주차기록 종료");
-                    setRoundedBg(startStopParkingBtnTv, 0xFF3B1219, 0xFFEF4444, 1, 8f);
-                    setTextColor.invoke(startStopParkingBtnTv, 0xFFFCA5A5);
-                } else {
-                    setText.invoke(startStopParkingBtnTv, "▶ 주차기록 지금 시작");
-                    setRoundedBg(startStopParkingBtnTv, 0xFF0F2942, 0xFF0EA5E9, 1, 8f);
-                    setTextColor.invoke(startStopParkingBtnTv, 0xFF38BDF8);
-                }
-
-                boolean manualIg3 = HkmcVehicleBridge.isManualIg3TestActive();
-                if (manualIg3) {
-                    setText.invoke(manualIg3BtnTv, "⚡ IG3 수동충전: ON (끄기)");
-                    setRoundedBg(manualIg3BtnTv, 0xFF064E3B, 0xFF10B981, 1, 8f);
-                    setTextColor.invoke(manualIg3BtnTv, 0xFFA7F3D0);
-                } else {
-                    setText.invoke(manualIg3BtnTv, "⚡ IG3 수동충전 테스트: OFF");
-                    setRoundedBg(manualIg3BtnTv, 0xFF1E293B, 0xFF475569, 1, 8f);
-                    setTextColor.invoke(manualIg3BtnTv, 0xFFE2E8F0);
-                }
-
-                setText.invoke(bottomNoticeTv, AuxMonMain.getStatusBannerMessage());
-                setTextColor.invoke(bottomNoticeTv, AuxMonMain.getStatusBannerColor());
+                String msg = AuxMonMain.getStatusBannerMessage();
+                setText(bannerTv, msg != null ? msg : "");
+                setColor(bannerTv, AuxMonMain.getStatusBannerColor());
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            System.out.println("[AuxMon] refresh error: " + t);
         }
 
         postDelayedToUi(REFRESH_UI_TASK, 1000L);
     }
 
-    private static void updateChargeHistoryTextOnUiThread(Method setText, ParkingSession sess) throws Exception {
-        if (chargeHistoryHeaderTv == null || chargeHistoryBodyTv == null) return;
-        if (sess == null || sess.samples.isEmpty()) {
-            setText.invoke(chargeHistoryHeaderTv, "⚡ 주차 중 보조배터리 자동충전 이력 (0회) 및 전압 기록");
-            setText.invoke(chargeHistoryBodyTv,
-                    "현재 대기 중입니다. 주행 종료(ACC/IGN OFF) 시 자동 기록되거나, 아래 [▶ 주차기록 지금 시작] 또는 [🧪 시뮬레이션 기록 생성]을 눌러 확인하세요.");
-            return;
+    /** One consistent snapshot of everything the panel shows for a single refresh pass. */
+    private static final class UiState {
+        ParkingSession active;
+        ParkingSession displayed;
+        LiveTelemetrySnapshot live;
+        boolean monitoring;
+        boolean driving;
+        boolean charging;
+        boolean tripped;
+        boolean autoKeep;
+        int targetHours;
+        String stateTitle;
+        String stateDesc;
+        int stateColor;
+
+        static UiState capture() {
+            UiState s = new UiState();
+            s.active = AuxMonMain.getActiveParkingSession();
+            s.displayed = AuxMonMain.getDisplayedSession();
+            s.live = AuxMonMain.getLatestLiveSnapshot();
+            s.monitoring = AuxMonMain.isCurrentlyMonitoringParking();
+            s.driving = s.live != null && s.live.isDrivingState();
+            s.charging = s.monitoring && ((s.live != null && s.live.isChargingActive())
+                    || (s.active != null && s.active.getOngoingChargeEvent() != null));
+            s.tripped = HkmcVehicleBridge.isSafetyCutoffTripped();
+            s.autoKeep = HkmcVehicleBridge.isAutoKeepOnShutdownEnabled();
+            s.targetHours = AuxMonMain.getConfiguredTargetHours();
+
+            if (s.charging) {
+                s.stateTitle = "자동 충전 중";
+                s.stateDesc = "차량이 12V 보조배터리를 충전하고 있습니다. 절전 유지는 계속됩니다.";
+                s.stateColor = C_GREEN;
+            } else if (s.monitoring) {
+                s.stateTitle = "절전 유지 중";
+                s.stateDesc = s.driving
+                        ? "기록을 진행하고 있습니다. 시동을 끄면 헤드유닛 전원을 계속 유지합니다."
+                        : "시동이 꺼져도 헤드유닛 전원을 유지하고 있습니다. 배터리가 부족해지면 자동으로 꺼집니다.";
+                s.stateColor = C_BLUE;
+            } else if (s.tripped) {
+                s.stateTitle = "배터리 보호로 중지됨";
+                s.stateDesc = "보조배터리를 지키기 위해 절전 유지를 멈췄습니다. 다음 시동 ON 때 자동으로 다시 켜집니다.";
+                s.stateColor = C_RED;
+            } else if (!s.autoKeep) {
+                s.stateTitle = "자동 유지 꺼짐";
+                s.stateDesc = "이번 주차에는 절전 유지를 하지 않습니다. 다음 시동 ON 때 자동으로 다시 켜집니다.";
+                s.stateColor = C_AMBER;
+            } else if (s.driving) {
+                s.stateTitle = "대기 중 · 시동 ON";
+                s.stateDesc = "시동을 끄면 자동으로 헤드유닛 전원을 유지하고 기록을 시작합니다.";
+                s.stateColor = C_BLUE;
+            } else {
+                s.stateTitle = "대기 중";
+                s.stateDesc = "시동을 끄면 자동으로 헤드유닛 전원을 유지하고 기록을 시작합니다.";
+                s.stateColor = C_TEXT;
+            }
+            return s;
+        }
+    }
+
+    private static void refreshCompact(UiState st) {
+        StringBuilder sb = new StringBuilder(96);
+        sb.append("🔋 ").append(st.stateTitle);
+        if (st.live != null && st.live.voltageV > 1.0f) {
+            sb.append("  ·  ").append(String.format(Locale.US, "%.1fV", Float.valueOf(st.live.voltageV)));
+        }
+        if (st.live != null && st.live.isSocValid()) {
+            sb.append("  ·  ").append(st.live.socPct).append('%');
+        }
+        if (st.monitoring && st.active != null) {
+            sb.append("  ·  ").append(AuxMonModels.formatDurationHms(st.active.getElapsedParkingSec()));
+        }
+        setText(compactTextView, sb.toString());
+        setColor(compactTextView, st.stateColor);
+    }
+
+    private static void refreshHero(UiState st) {
+        setText(heroTitleTv, st.stateTitle);
+        setColor(heroTitleTv, st.stateColor);
+        setText(heroDescTv, st.stateDesc);
+
+        if (st.monitoring && st.active != null) {
+            setText(heroTimeCaptionTv, st.driving ? "기록 경과 시간" : "시동 OFF 후 경과 시간");
+            setText(heroTimeTv, AuxMonModels.formatDurationHms(st.active.getElapsedParkingSec()));
+            setColor(heroTimeTv, C_TEXT);
+            int h = st.active.targetParkingHours;
+            setText(heroTargetTv, h <= 0
+                    ? "목표: 상시 유지 (배터리 보호 조건까지)"
+                    : ("목표: " + h + "시간  ·  " + st.active.getProgressPercent() + "% 진행"));
+        } else {
+            setText(heroTimeCaptionTv, "절전 유지 경과 시간");
+            setText(heroTimeTv, "--:--:--");
+            setColor(heroTimeTv, C_TEXT_DIM);
+            setText(heroTargetTv, "설정된 유지 시간: " + (st.targetHours <= 0 ? "상시" : (st.targetHours + "시간")));
         }
 
-        synchronized (sess) {
-            int chgCnt = sess.chargeEvents.size();
-            setText.invoke(chargeHistoryHeaderTv, String.format(Locale.US,
-                    "⚡ 주차 세션 [%s] 충전 이력 (총 %d회 충전 / 샘플 %d건 / 시작 %s)",
-                    sess.sessionId, Integer.valueOf(chgCnt), Integer.valueOf(sess.samples.size()),
-                    AuxMonModels.formatTimestampIso(sess.driveEndEpochMs)));
-
-            StringBuilder sb = new StringBuilder(512);
-            long curElapsed = sess.getElapsedParkingSec();
-
-            if (chgCnt == 0) {
-                sb.append("• 자동충전(IG3) 이력: 아직 감지된 보조배터리 충전 이벤트가 없습니다.\n");
+        long nowRt = AuxMonModels.elapsedRealtimeMs();
+        if (st.monitoring) {
+            if (nowRt < stopConfirmUntilRt) {
+                setText(primaryBtnTv, "한 번 더 누르면 중지합니다");
+                bg(primaryBtnTv, 0xFFDC2626, 0xFFDC2626, 1f, 14f);
+                setColor(primaryBtnTv, 0xFFFFFFFF);
             } else {
-                int startIdx = Math.max(0, chgCnt - 3);
-                for (int i = startIdx; i < chgCnt; i++) {
+                setText(primaryBtnTv, "■  절전 유지 중지");
+                bg(primaryBtnTv, 0xFF3B1219, C_RED, 1.5f, 14f);
+                setColor(primaryBtnTv, 0xFFFECACA);
+            }
+            setText(primaryHintTv, st.driving
+                    ? "주행 중에는 기록만 멈추고, 다음 시동 OFF 때 다시 자동으로 유지합니다."
+                    : "중지하면 헤드유닛 전원이 바로 꺼집니다.");
+        } else {
+            setText(primaryBtnTv, "▶  지금 절전 유지 시작");
+            bg(primaryBtnTv, 0xFF0369A1, 0xFF0EA5E9, 1.5f, 14f);
+            setColor(primaryBtnTv, 0xFFFFFFFF);
+            if (st.tripped) {
+                setText(primaryHintTv, "직접 시작하면 배터리 보호 차단이 해제됩니다. 배터리 상태를 확인한 뒤 누르세요.");
+            } else if (!st.autoKeep) {
+                setText(primaryHintTv, "누르면 지금 바로 절전 유지를 다시 시작합니다.");
+            } else {
+                setText(primaryHintTv, "보통은 누르지 않아도 됩니다. 시동을 끄면 자동으로 시작됩니다.");
+            }
+        }
+    }
+
+    private static void refreshOverview(UiState st) {
+        LiveTelemetrySnapshot live = st.live;
+        ParkingSession sess = st.monitoring ? st.active : null;
+
+        // Tile 1: voltage
+        if (live != null && live.voltageV > 1.0f) {
+            setText(tileVoltValueTv, String.format(Locale.US, "%.2f V", Float.valueOf(live.voltageV)));
+            setColor(tileVoltValueTv, C_TEXT);
+            StringBuilder sub = new StringBuilder(live.isDirectVoltageMeasured() ? "실측값" : "추정값 (충전율로 계산)");
+            if (sess != null && !sess.samples.isEmpty() && sess.maxVoltageV > 1.0f && sess.minVoltageV < 50f) {
+                sub.append(String.format(Locale.US, "\n이번 주차 최저 %.2f V · 최고 %.2f V",
+                        Float.valueOf(sess.minVoltageV), Float.valueOf(sess.maxVoltageV)));
+            }
+            setText(tileVoltSubTv, sub.toString());
+        } else {
+            setText(tileVoltValueTv, "--");
+            setColor(tileVoltValueTv, C_TEXT_DIM);
+            setText(tileVoltSubTv, "아직 읽지 못했습니다");
+        }
+
+        // Tile 2: SOC
+        if (live != null && live.isSocValid()) {
+            setText(tileSocValueTv, live.socPct + " %");
+            setColor(tileSocValueTv, live.socPct < AuxMonMain.SAFETY_MIN_SOC_PCT + 5 ? C_AMBER : C_TEXT);
+            StringBuilder sub = new StringBuilder();
+            if (sess != null && sess.startSocPct > 0 && sess.startSocPct <= 100) {
+                sub.append("주차 시작 ").append(sess.startSocPct).append("% → 지금 ").append(live.socPct).append('%');
+            } else {
+                sub.append("12V 보조배터리 충전 상태");
+            }
+            if (live.batSocStatusFlag == 1) {
+                sub.append("\n차량이 배터리 상태를 '비정상'으로 보고했습니다");
+            }
+            setText(tileSocSubTv, sub.toString());
+        } else {
+            setText(tileSocValueTv, "--");
+            setColor(tileSocValueTv, C_TEXT_DIM);
+            setText(tileSocSubTv, "차량에서 충전율을 아직 받지 못했습니다.\n30분 넘게 모르면 안전을 위해 꺼집니다");
+        }
+
+        // Tile 3: auto-charge count
+        if (sess != null) {
+            int cnt = sess.getChargeCount();
+            setText(tileChgValueTv, cnt + " 회");
+            setColor(tileChgValueTv, st.charging ? C_GREEN : C_TEXT);
+            if (st.charging) {
+                setText(tileChgSubTv, "지금 충전 중입니다");
+            } else if (cnt > 0) {
+                setText(tileChgSubTv, "누적 충전 시간 " + AuxMonModels.formatDurationHms(sess.getTotalChargeDurationSec()));
+            } else {
+                setText(tileChgSubTv, "아직 없습니다. 차량이 자동 충전하면 여기에 기록됩니다");
+            }
+        } else {
+            setText(tileChgValueTv, "-");
+            setColor(tileChgValueTv, C_TEXT_DIM);
+            setText(tileChgSubTv, "절전 유지 중에 횟수를 셉니다");
+        }
+
+        // Tile 4: discharge protection
+        if (st.tripped) {
+            setText(tileProtValueTv, "차단됨");
+            setColor(tileProtValueTv, C_RED);
+            setText(tileProtSubTv, "배터리를 지키기 위해 절전 유지를 멈췄습니다");
+        } else if (live != null && (live.autoCutPreWrng > 0 || live.batEvtAlarm > 0 || live.batSocStatusFlag == 1)) {
+            setText(tileProtValueTv, "경고");
+            setColor(tileProtValueTv, C_RED);
+            setText(tileProtSubTv, "차량이 배터리 경고를 보냈습니다. 곧 자동으로 꺼집니다");
+        } else if (live != null && live.isSocValid() && live.socPct < AuxMonMain.SAFETY_MIN_SOC_PCT + 5) {
+            setText(tileProtValueTv, "주의");
+            setColor(tileProtValueTv, C_AMBER);
+            setText(tileProtSubTv, "충전율이 " + AuxMonMain.SAFETY_MIN_SOC_PCT + "% 아래로 내려가면 자동으로 꺼집니다");
+        } else {
+            setText(tileProtValueTv, "정상");
+            setColor(tileProtValueTv, C_GREEN);
+            setText(tileProtSubTv, "충전율 " + AuxMonMain.SAFETY_MIN_SOC_PCT + "% 미만, 저전압, 차량 경고 시 자동으로 꺼집니다");
+        }
+    }
+
+    private static void refreshSessionNav(Object labelTv, ParkingSession sess) {
+        if (labelTv == null) return;
+        if (sess == null) {
+            setText(labelTv, "기록 없음");
+            return;
+        }
+        String nav = AuxMonMain.getSessionNavLabel();
+        int p = (nav != null) ? nav.lastIndexOf('(') : -1;
+        String pos = (p >= 0) ? ("  " + nav.substring(p)) : "";
+        String when = AuxMonModels.formatTimestampIso(sess.driveEndEpochMs);
+        if (when.length() >= 16) {
+            when = when.substring(5, 16); // MM-dd HH:mm
+        }
+        setText(labelTv, when + " 주차  ·  " + sessionStatusLabel(sess.status) + pos);
+    }
+
+    private static String sessionStatusLabel(int status) {
+        switch (status) {
+            case AuxMonModels.SESSION_MONITORING_PARKING:
+                return "기록 중";
+            case AuxMonModels.SESSION_COMPLETED_N_HOURS:
+                return "완료";
+            case AuxMonModels.SESSION_SAFETY_CUTOFF:
+                return "배터리 보호로 종료";
+            case AuxMonModels.SESSION_ENDED_BY_DRIVE:
+                return "시동 ON으로 종료";
+            case AuxMonModels.SESSION_INTERRUPTED_REBOOT:
+                return "재부팅으로 중단";
+            default:
+                return "대기";
+        }
+    }
+
+    private static String buildHistoryText(ParkingSession sess) {
+        if (sess == null || sess.samples.isEmpty()) {
+            return "아직 기록이 없습니다.\n\n시동을 끄면 자동으로 기록이 시작됩니다.\n"
+                    + "화면을 미리 보고 싶다면 [설정] 탭의 [샘플 기록 만들기]를 누르세요.";
+        }
+        StringBuilder sb = new StringBuilder(1024);
+        synchronized (sess) {
+            long curElapsed = sess.getElapsedParkingSec();
+            sb.append("주차 시작   ").append(AuxMonModels.formatTimestampIso(sess.driveEndEpochMs)).append('\n');
+            sb.append("유지 시간   ").append(AuxMonModels.formatDurationHms(curElapsed))
+                    .append("   ·   ").append(sessionStatusLabel(sess.status))
+                    .append("   ·   기록 ").append(sess.samples.size()).append("건\n");
+            sb.append("충전율       ").append(AuxMonModels.formatSocPct(sess.startSocPct))
+                    .append("  →  ").append(AuxMonModels.formatSocPct(sess.latestSocPct)).append("\n\n");
+
+            int cnt = sess.chargeEvents.size();
+            sb.append("■ 자동 충전 ").append(cnt).append("회");
+            if (cnt > 0) {
+                sb.append("  (누적 ").append(AuxMonModels.formatDurationHms(sess.getTotalChargeDurationSec())).append(')');
+            }
+            sb.append('\n');
+            if (cnt == 0) {
+                sb.append("   주차 중 자동 충전이 아직 없었습니다.\n");
+            } else {
+                int shown = 0;
+                for (int i = cnt - 1; i >= 0 && shown < 20; i--, shown++) {
                     ChargeEvent ce = sess.chargeEvents.get(i);
-                    long dur = ce.getDurationSec(curElapsed);
-                    sb.append(String.format(Locale.US,
-                            "• [충전 #%d] 주차 +%s (%s ~ %s, 지속 %s)  |  전압 %.2fV(%s) → 최고 %.2fV → %.2fV(%s)  |  사유: %s\n",
+                    boolean ongoing = ce.endEpochMs <= 0L;
+                    sb.append(String.format(Locale.US, "   #%d   %s ~ %s   (%s%s)\n",
                             Integer.valueOf(ce.chargeIndex),
-                            AuxMonModels.formatDurationHms(ce.startElapsedSec),
-                            AuxMonModels.formatTimeOnly(ce.startEpochMs),
-                            ce.endEpochMs > 0L ? AuxMonModels.formatTimeOnly(ce.endEpochMs) : "진행중",
-                            AuxMonModels.formatDurationHms(dur),
+                            shortTime(ce.startEpochMs),
+                            ongoing ? "진행 중" : shortTime(ce.endEpochMs),
+                            AuxMonModels.formatDurationHms(ce.getDurationSec(curElapsed)),
+                            ongoing ? ", 충전 중" : ""));
+                    sb.append(String.format(Locale.US, "         전압 %.2f → 최고 %.2f → %.2f V   ·   충전율 %s → %s\n",
                             Float.valueOf(ce.startVoltageV),
-                            AuxMonModels.formatSocPct(ce.startSocPct),
                             Float.valueOf(ce.peakVoltageV),
-                            Float.valueOf(ce.endVoltageV),
-                            AuxMonModels.formatSocPct(ce.endSocPct),
-                            ce.triggerReason));
+                            Float.valueOf(ongoing ? sess.latestVoltageV : ce.endVoltageV),
+                            AuxMonModels.formatSocPct(ce.startSocPct),
+                            AuxMonModels.formatSocPct(ongoing ? sess.latestSocPct : ce.endSocPct)));
+                }
+                if (cnt > 20) {
+                    sb.append("   … 이전 ").append(cnt - 20).append("회는 USB로 내보내면 모두 볼 수 있습니다\n");
                 }
             }
 
-            // Append summary of recent voltage checkpoints
+            sb.append("\n■ 전압 변화\n");
             int n = sess.samples.size();
-            sb.append("• 전압 추이: ");
-            int checkpoints = Math.min(6, n);
+            int checkpoints = Math.min(8, n);
             for (int k = 0; k < checkpoints; k++) {
                 int idx = (checkpoints == 1) ? 0 : (k * (n - 1)) / (checkpoints - 1);
                 VoltageSample vs = sess.samples.get(idx);
-                if (k > 0) sb.append("  →  ");
-                sb.append(String.format(Locale.US, "+%dh%02dm: %.2fV(%s)",
+                sb.append(String.format(Locale.US, "   +%dh %02dm     %.2f V     %s\n",
                         Long.valueOf(vs.elapsedParkingSec / 3600L),
                         Long.valueOf((vs.elapsedParkingSec % 3600L) / 60L),
                         Float.valueOf(vs.voltageV),
                         AuxMonModels.formatSocPct(vs.socPct)));
             }
-            setText.invoke(chargeHistoryBodyTv, sb.toString());
+        }
+        return sb.toString();
+    }
+
+    private static String shortTime(long epochMs) {
+        String t = AuxMonModels.formatTimeOnly(epochMs);
+        return t.length() >= 5 ? t.substring(0, 5) : t;
+    }
+
+    private static void refreshSettings(UiState st) {
+        int hours = st.targetHours;
+        for (int i = 0; i < HOUR_PRESETS.length; i++) {
+            styleChip(hourChips[i], HOUR_PRESETS[i] == hours);
+        }
+        setText(hourValueTv, hours <= 0 ? "상시" : (hours + "시간"));
+
+        int interval = AuxMonMain.getConfiguredSampleIntervalSec();
+        for (int i = 0; i < INTERVAL_PRESETS.length; i++) {
+            styleChip(intervalChips[i], INTERVAL_PRESETS[i] == interval);
+        }
+
+        int mode = AuxMonMain.getConfiguredAutoChargeMode();
+        styleChip(modeChips[0], mode == AuxMonModels.MODE_PASSIVE_OBSERVE);
+        styleChip(modeChips[1], mode == AuxMonModels.MODE_ACTIVE_1H_IG3);
+        setText(modeDescTv, mode == AuxMonModels.MODE_ACTIVE_1H_IG3
+                ? "주차 중 1시간마다 차량에 보조배터리 충전(IG3)을 요청합니다. 충전 중에는 12V 전압이 올라갑니다."
+                : "차량의 자체 보조배터리 충전 기능(Aux. Battery Saver+)이 언제 동작하는지 그대로 기록만 합니다.");
+
+        if (HkmcVehicleBridge.isManualIg3TestActive()) {
+            setText(ig3TestBtnTv, "⚡  IG3 충전 테스트 중지");
+            bg(ig3TestBtnTv, 0xFF064E3B, C_GREEN, 1f, 10f);
+            setColor(ig3TestBtnTv, 0xFFA7F3D0);
+        } else {
+            setText(ig3TestBtnTv, "⚡  IG3 충전 테스트 시작");
+            styleSecondary(ig3TestBtnTv);
         }
     }
 
-    /**
-     * Draws the N-hour parking 12V Voltage (V), SOC (%), and IG3 Auto-Charging bands onto chartBitmap.
-     */
-    private static void renderVoltageChartOnUiThread(ParkingSession sess, LiveTelemetrySnapshot live, int defaultHours) {
+    // ========================================================================
+    // CHART
+    // ========================================================================
+
+    /** Draws voltage (V), SOC (%) and auto-charge bands, sized to the ImageView's measured size. */
+    private static void renderVoltageChartOnUiThread(ParkingSession sess, int defaultHours) {
         if (chartImageView == null) return;
         try {
+            int w = ((Integer) cView.getMethod("getWidth").invoke(chartImageView)).intValue();
+            int h = ((Integer) cView.getMethod("getHeight").invoke(chartImageView)).intValue();
+            if (w <= 0 || h <= 0) return; // not laid out yet; next refresh will draw
+
             Class<?> bmpCls = Class.forName("android.graphics.Bitmap");
             Class<?> cfgCls = Class.forName("android.graphics.Bitmap$Config");
             Class<?> canvasCls = Class.forName("android.graphics.Canvas");
@@ -1035,150 +1591,175 @@ public final class AuxMonOverlay {
             Class<?> styleCls = Class.forName("android.graphics.Paint$Style");
             Class<?> ivCls = Class.forName("android.widget.ImageView");
 
-            if (chartBitmap == null) {
+            if (chartBitmap == null || chartBmpW != w || chartBmpH != h) {
+                ivCls.getMethod("setImageBitmap", bmpCls).invoke(chartImageView, (Object) null);
+                if (chartBitmap != null) {
+                    try {
+                        bmpCls.getMethod("recycle").invoke(chartBitmap);
+                    } catch (Throwable ignored) {
+                    }
+                }
                 Object argb8888 = cfgCls.getField("ARGB_8888").get(null);
                 chartBitmap = bmpCls.getMethod("createBitmap", int.class, int.class, cfgCls)
-                        .invoke(null, Integer.valueOf(CHART_WIDTH), Integer.valueOf(CHART_HEIGHT), argb8888);
+                        .invoke(null, Integer.valueOf(w), Integer.valueOf(h), argb8888);
+                chartBmpW = w;
+                chartBmpH = h;
             }
 
-            bmpCls.getMethod("eraseColor", int.class).invoke(chartBitmap, Integer.valueOf(0xFF090F1A));
+            bmpCls.getMethod("eraseColor", int.class).invoke(chartBitmap, Integer.valueOf(C_SURFACE));
             Object canvas = canvasCls.getConstructor(bmpCls).newInstance(chartBitmap);
-
             Object paint = paintCls.getConstructor(int.class).newInstance(Integer.valueOf(1)); // ANTI_ALIAS_FLAG
-            Method setColor = paintCls.getMethod("setColor", int.class);
+            Method setColorM = paintCls.getMethod("setColor", int.class);
             Method setStrokeWidth = paintCls.getMethod("setStrokeWidth", float.class);
             Method setTextSize = paintCls.getMethod("setTextSize", float.class);
             Method setStyle = paintCls.getMethod("setStyle", styleCls);
+            Method measureText = paintCls.getMethod("measureText", String.class);
             Object styleFill = styleCls.getField("FILL").get(null);
             Object styleStroke = styleCls.getField("STROKE").get(null);
-
             Method drawLine = canvasCls.getMethod("drawLine", float.class, float.class, float.class, float.class, paintCls);
             Method drawRect = canvasCls.getMethod("drawRect", float.class, float.class, float.class, float.class, paintCls);
             Method drawText = canvasCls.getMethod("drawText", String.class, float.class, float.class, paintCls);
 
-            final float padLeft = 46f;
-            final float padRight = 42f;
-            final float padTop = 22f;
-            final float padBottom = 22f;
-            final float plotW = CHART_WIDTH - padLeft - padRight;
-            final float plotH = CHART_HEIGHT - padTop - padBottom;
-
+            final float padLeft = dp(56);
+            final float padRight = dp(48);
+            final float padTop = dp(34);
+            final float padBottom = dp(28);
+            final float plotW = w - padLeft - padRight;
+            final float plotH = h - padTop - padBottom;
             final float minV = 11.0f;
             final float maxV = 15.0f;
+            final float fsLabel = 13f * density;
+            final float fsAxis = 12f * density;
 
-            // 1. Title & Legend inside chart header
+            // Title + legend
             setStyle.invoke(paint, styleFill);
-            setTextSize.invoke(paint, Float.valueOf(11.5f));
-            setColor.invoke(paint, Integer.valueOf(0xFF94A3B8));
-            drawText.invoke(canvas, "주차 시간대별 보조배터리 전압(11.0V~15.0V) & 자동충전(IG3) 그래프", Float.valueOf(padLeft), Float.valueOf(14f), paint);
+            setTextSize.invoke(paint, Float.valueOf(fsLabel));
+            setColorM.invoke(paint, Integer.valueOf(C_TEXT_SUB));
+            drawText.invoke(canvas, "주차 중 12V 보조배터리 전압 · 충전율 · 자동 충전 구간", Float.valueOf(padLeft), Float.valueOf(dp(20)), paint);
 
-            setColor.invoke(paint, Integer.valueOf(0xFF38BDF8));
-            drawText.invoke(canvas, "━ 전압(V)", Float.valueOf(CHART_WIDTH - 240f), Float.valueOf(14f), paint);
-            setColor.invoke(paint, Integer.valueOf(0xFFFBBF24));
-            drawText.invoke(canvas, "━ SOC(%)", Float.valueOf(CHART_WIDTH - 170f), Float.valueOf(14f), paint);
-            setColor.invoke(paint, Integer.valueOf(0xFF10B981));
-            drawText.invoke(canvas, "█ IG3 충전구간", Float.valueOf(CHART_WIDTH - 100f), Float.valueOf(14f), paint);
+            String[] legends = new String[]{"━ 전압 (왼쪽 축)", "━ 충전율 (오른쪽 축)", "█ 자동 충전"};
+            int[] legendColors = new int[]{C_BLUE, 0xFFFB923C, C_GREEN};
+            float lx = w - padRight;
+            for (int i = legends.length - 1; i >= 0; i--) {
+                float tw = ((Float) measureText.invoke(paint, legends[i])).floatValue();
+                lx -= tw;
+                setColorM.invoke(paint, Integer.valueOf(legendColors[i]));
+                drawText.invoke(canvas, legends[i], Float.valueOf(lx), Float.valueOf(dp(20)), paint);
+                lx -= dp(18);
+            }
 
-            // 2. Horizontal voltage grid lines (11V, 12V, 13V, 14V, 15V)
-            setStrokeWidth.invoke(paint, Float.valueOf(1.0f));
-            setTextSize.invoke(paint, Float.valueOf(10.5f));
+            // Horizontal grid (11..15 V / 0..100 %)
+            setStrokeWidth.invoke(paint, Float.valueOf(Math.max(1f, density * 0.7f)));
+            setTextSize.invoke(paint, Float.valueOf(fsAxis));
             for (int v = 11; v <= 15; v++) {
-                float ratio = (v - minV) / (maxV - minV);
-                float y = padTop + plotH - (ratio * plotH);
-                setColor.invoke(paint, Integer.valueOf(v == 12 ? 0xFF334155 : 0xFF1E293B));
+                float y = padTop + plotH - ((v - minV) / (maxV - minV)) * plotH;
+                setColorM.invoke(paint, Integer.valueOf(v == 12 ? 0xFF3B4A66 : C_BORDER));
                 drawLine.invoke(canvas, Float.valueOf(padLeft), Float.valueOf(y), Float.valueOf(padLeft + plotW), Float.valueOf(y), paint);
-
-                setColor.invoke(paint, Integer.valueOf(0xFF64748B));
-                drawText.invoke(canvas, v + ".0V", Float.valueOf(4f), Float.valueOf(y + 4f), paint);
-
-                int socAxis = (v - 11) * 25;
-                drawText.invoke(canvas, socAxis + "%", Float.valueOf(padLeft + plotW + 5f), Float.valueOf(y + 4f), paint);
+                setColorM.invoke(paint, Integer.valueOf(C_TEXT_DIM));
+                drawText.invoke(canvas, v + "V", Float.valueOf(dp(10)), Float.valueOf(y + dp(4)), paint);
+                drawText.invoke(canvas, ((v - 11) * 25) + "%", Float.valueOf(padLeft + plotW + dp(6)), Float.valueOf(y + dp(4)), paint);
             }
 
             int hours = (sess != null && sess.targetParkingHours > 0) ? sess.targetParkingHours : defaultHours;
-            long maxTimeSec = Math.max(3600L, (long) hours * 3600L);
+            long maxTimeSec = Math.max(3600L, (long) Math.max(1, hours) * 3600L);
             if (sess != null && sess.getElapsedParkingSec() > maxTimeSec) {
                 maxTimeSec = sess.getElapsedParkingSec();
             }
-
-            // 3. Vertical time grid lines (0h .. Nh)
-            int gridSteps = Math.min(hours, 6);
-            if (gridSteps < 1) gridSteps = 1;
-            for (int g = 0; g <= gridSteps; g++) {
-                float x = padLeft + ((plotW * g) / (float) gridSteps);
-                setColor.invoke(paint, Integer.valueOf(0xFF1E293B));
-                drawLine.invoke(canvas, Float.valueOf(x), Float.valueOf(padTop), Float.valueOf(x), Float.valueOf(padTop + plotH), paint);
-                setColor.invoke(paint, Integer.valueOf(0xFF64748B));
-                long labelSec = (maxTimeSec * g) / gridSteps;
-                String tLbl = String.format(Locale.US, "+%.1fh", Float.valueOf(labelSec / 3600.0f));
-                drawText.invoke(canvas, tLbl, Float.valueOf(x - 14f), Float.valueOf(CHART_HEIGHT - 5f), paint);
+            if (sess != null && hours <= 0) {
+                // 상시 mode: fit the axis to what has been recorded (at least 1 h)
+                maxTimeSec = Math.max(3600L, sess.getElapsedParkingSec());
             }
 
-            if (sess != null) {
+            // Vertical time grid
+            int gridSteps = 6;
+            for (int g = 0; g <= gridSteps; g++) {
+                float x = padLeft + (plotW * g) / gridSteps;
+                setColorM.invoke(paint, Integer.valueOf(C_BORDER));
+                drawLine.invoke(canvas, Float.valueOf(x), Float.valueOf(padTop), Float.valueOf(x), Float.valueOf(padTop + plotH), paint);
+                setColorM.invoke(paint, Integer.valueOf(C_TEXT_DIM));
+                long labelSec = (maxTimeSec * g) / gridSteps;
+                String tLbl = String.format(Locale.US, "+%dh%02dm", Long.valueOf(labelSec / 3600L), Long.valueOf((labelSec % 3600L) / 60L));
+                float tw = ((Float) measureText.invoke(paint, tLbl)).floatValue();
+                drawText.invoke(canvas, tLbl, Float.valueOf(x - tw / 2f), Float.valueOf(h - dp(8)), paint);
+            }
+
+            if (sess == null || sess.samples.isEmpty()) {
+                setTextSize.invoke(paint, Float.valueOf(16f * density));
+                setColorM.invoke(paint, Integer.valueOf(C_TEXT_SUB));
+                String msg = "표시할 기록이 없습니다. 시동을 끄면 자동으로 기록됩니다.";
+                float tw = ((Float) measureText.invoke(paint, msg)).floatValue();
+                drawText.invoke(canvas, msg, Float.valueOf(padLeft + (plotW - tw) / 2f), Float.valueOf(padTop + plotH / 2f), paint);
+            } else {
                 synchronized (sess) {
-                    // 4. Shaded Green Bands for each IG3 Charging Event
+                    // Charge bands
                     for (int i = 0; i < sess.chargeEvents.size(); i++) {
                         ChargeEvent ce = sess.chargeEvents.get(i);
                         float x1 = padLeft + Math.min(1.0f, (float) ce.startElapsedSec / (float) maxTimeSec) * plotW;
                         long endEl = (ce.endElapsedSec >= ce.startElapsedSec && ce.endEpochMs > 0L)
                                 ? ce.endElapsedSec : sess.getElapsedParkingSec();
                         float x2 = padLeft + Math.min(1.0f, (float) Math.max(ce.startElapsedSec + 60L, endEl) / (float) maxTimeSec) * plotW;
-                        if (x2 - x1 < 6.0f) x2 = x1 + 6.0f;
-
+                        if (x2 - x1 < dp(4)) x2 = x1 + dp(4);
                         setStyle.invoke(paint, styleFill);
-                        setColor.invoke(paint, Integer.valueOf(0x4410B981));
+                        setColorM.invoke(paint, Integer.valueOf(0x4034D399));
                         drawRect.invoke(canvas, Float.valueOf(x1), Float.valueOf(padTop), Float.valueOf(x2), Float.valueOf(padTop + plotH), paint);
-
-                        setColor.invoke(paint, Integer.valueOf(0xFF10B981));
-                        setTextSize.invoke(paint, Float.valueOf(10.5f));
-                        drawText.invoke(canvas, "⚡#" + ce.chargeIndex, Float.valueOf(x1 + 2f), Float.valueOf(padTop + 12f), paint);
+                        setColorM.invoke(paint, Integer.valueOf(C_GREEN));
+                        setTextSize.invoke(paint, Float.valueOf(fsAxis));
+                        drawText.invoke(canvas, "#" + ce.chargeIndex, Float.valueOf(x1 + dp(3)), Float.valueOf(padTop + dp(14)), paint);
                     }
 
-                    // 5. Plot SOC (%) Curve (Amber) & Voltage (V) Curve (Cyan)
                     List<VoltageSample> pts = sess.samples;
                     int n = pts.size();
+                    setStyle.invoke(paint, styleStroke);
                     if (n >= 2) {
-                        setStyle.invoke(paint, styleStroke);
                         // SOC line
-                        setStrokeWidth.invoke(paint, Float.valueOf(1.5f));
-                        setColor.invoke(paint, Integer.valueOf(0xAAFB923C));
+                        setStrokeWidth.invoke(paint, Float.valueOf(1.6f * density));
+                        setColorM.invoke(paint, Integer.valueOf(0xCCFB923C));
                         float prevX = 0f;
-                        float prevSocY = 0f;
+                        float prevY = 0f;
+                        boolean havePrev = false;
                         for (int i = 0; i < n; i++) {
                             VoltageSample vs = pts.get(i);
+                            if (vs.socPct <= 0 || vs.socPct > 100) {
+                                havePrev = false; // unknown SOC -> break the line instead of dropping to 0 %
+                                continue;
+                            }
                             float x = padLeft + Math.min(1.0f, (float) vs.elapsedParkingSec / (float) maxTimeSec) * plotW;
-                            float socRatio = Math.max(0f, Math.min(1f, vs.socPct / 100.0f));
-                            float y = padTop + plotH - (socRatio * plotH);
-                            if (i > 0) {
-                                drawLine.invoke(canvas, Float.valueOf(prevX), Float.valueOf(prevSocY), Float.valueOf(x), Float.valueOf(y), paint);
+                            float y = padTop + plotH - (vs.socPct / 100.0f) * plotH;
+                            if (havePrev) {
+                                drawLine.invoke(canvas, Float.valueOf(prevX), Float.valueOf(prevY), Float.valueOf(x), Float.valueOf(y), paint);
                             }
                             prevX = x;
-                            prevSocY = y;
+                            prevY = y;
+                            havePrev = true;
                         }
 
                         // Voltage line
-                        setStrokeWidth.invoke(paint, Float.valueOf(2.4f));
-                        setColor.invoke(paint, Integer.valueOf(0xFF38BDF8));
-                        float prevVY = 0f;
+                        setStrokeWidth.invoke(paint, Float.valueOf(2.4f * density));
+                        setColorM.invoke(paint, Integer.valueOf(C_BLUE));
+                        havePrev = false;
                         for (int i = 0; i < n; i++) {
                             VoltageSample vs = pts.get(i);
+                            if (vs.voltageV < 1.0f) {
+                                havePrev = false;
+                                continue;
+                            }
                             float x = padLeft + Math.min(1.0f, (float) vs.elapsedParkingSec / (float) maxTimeSec) * plotW;
                             float vClamped = Math.max(minV, Math.min(maxV, vs.voltageV));
-                            float vRatio = (vClamped - minV) / (maxV - minV);
-                            float y = padTop + plotH - (vRatio * plotH);
-                            if (i > 0) {
-                                drawLine.invoke(canvas, Float.valueOf(prevX), Float.valueOf(prevVY), Float.valueOf(x), Float.valueOf(y), paint);
+                            float y = padTop + plotH - ((vClamped - minV) / (maxV - minV)) * plotH;
+                            if (havePrev) {
+                                drawLine.invoke(canvas, Float.valueOf(prevX), Float.valueOf(prevY), Float.valueOf(x), Float.valueOf(y), paint);
                             }
                             prevX = x;
-                            prevVY = y;
+                            prevY = y;
+                            havePrev = true;
                         }
-                    } else if (n == 1) {
+                    } else {
                         VoltageSample vs = pts.get(0);
                         float vClamped = Math.max(minV, Math.min(maxV, vs.voltageV));
-                        float y = padTop + plotH - (((vClamped - minV) / (maxV - minV)) * plotH);
-                        setColor.invoke(paint, Integer.valueOf(0xFF38BDF8));
-                        setStrokeWidth.invoke(paint, Float.valueOf(3.0f));
-                        drawLine.invoke(canvas, Float.valueOf(padLeft), Float.valueOf(y), Float.valueOf(padLeft + 12f), Float.valueOf(y), paint);
+                        float y = padTop + plotH - ((vClamped - minV) / (maxV - minV)) * plotH;
+                        setColorM.invoke(paint, Integer.valueOf(C_BLUE));
+                        setStrokeWidth.invoke(paint, Float.valueOf(3.0f * density));
+                        drawLine.invoke(canvas, Float.valueOf(padLeft), Float.valueOf(y), Float.valueOf(padLeft + dp(12)), Float.valueOf(y), paint);
                     }
                 }
             }
@@ -1189,37 +1770,25 @@ public final class AuxMonOverlay {
         }
     }
 
-    private static void updateWindowPositionOnUiThread(int newX, int newY) {
-        Object root = rootOverlayView;
-        Object lp = currentWmLp;
-        if (root == null || lp == null || windowManager == null) return;
+    // ========================================================================
+    // TOUCH
+    // ========================================================================
+
+    /**
+     * Touch handler with press feedback (alpha). draggable=true is used only by the compact pill:
+     * a drag moves the window, a tap runs the action. Non-draggable views cancel the click when the
+     * finger slides away (so scrolling a ScrollView over a button does not trigger it).
+     */
+    private static void attachTouch(final Object view, final Runnable clickAction, final boolean draggable) throws Exception {
         try {
-            int clampedX = Math.max(0, Math.min(MAX_SCREEN_X, newX));
-            int clampedY = Math.max(0, Math.min(MAX_SCREEN_Y, newY));
-            winX = clampedX;
-            winY = clampedY;
-
-            Class<?> viewCls = Class.forName("android.view.View");
-            Class<?> wmLpCls = Class.forName("android.view.WindowManager$LayoutParams");
-            wmLpCls.getField("x").setInt(lp, clampedX);
-            wmLpCls.getField("y").setInt(lp, clampedY);
-
-            Class<?> vgLpCls = Class.forName("android.view.ViewGroup$LayoutParams");
-            Class<?> vmCls = Class.forName("android.view.ViewManager");
-            vmCls.getMethod("updateViewLayout", viewCls, vgLpCls).invoke(windowManager, root, lp);
+            cView.getMethod("setSoundEffectsEnabled", boolean.class).invoke(view, false);
+            cView.getMethod("setHapticFeedbackEnabled", boolean.class).invoke(view, false);
         } catch (Throwable ignored) {
         }
-    }
-
-    private static void attachDragOnlyListener(Object view) throws Exception {
-        attachButtonOrDragListener(view, null);
-    }
-
-    private static void attachButtonOrDragListener(Object view, final Runnable clickAction) throws Exception {
-        disableViewEffects(view);
         Class<?> touchListenerCls = Class.forName("android.view.View$OnTouchListener");
-        Class<?> viewCls = Class.forName("android.view.View");
-        viewCls.getMethod("setClickable", boolean.class).invoke(view, true);
+        cView.getMethod("setClickable", boolean.class).invoke(view, true);
+        final int slop = dp(12);
+        final int cancelSlop = dp(28);
 
         Object proxy = Proxy.newProxyInstance(
                 touchListenerCls.getClassLoader(),
@@ -1230,6 +1799,14 @@ public final class AuxMonOverlay {
                     private int startX = 0;
                     private int startY = 0;
                     private boolean dragging = false;
+                    private boolean canceled = false;
+
+                    private void pressed(boolean on) {
+                        try {
+                            mSetAlpha.invoke(view, on ? 0.6f : 1.0f);
+                        } catch (Throwable ignored) {
+                        }
+                    }
 
                     @Override
                     public Object invoke(Object proxyObj, Method method, Object[] args) {
@@ -1251,26 +1828,39 @@ public final class AuxMonOverlay {
                                 float rawX = ((Float) meCls.getMethod("getRawX").invoke(me)).floatValue();
                                 float rawY = ((Float) meCls.getMethod("getRawY").invoke(me)).floatValue();
 
-                                if (act == 0) {
+                                if (act == 0) { // DOWN
                                     downRawX = rawX;
                                     downRawY = rawY;
                                     startX = winX;
                                     startY = winY;
                                     dragging = false;
-                                } else if (act == 2) {
+                                    canceled = false;
+                                    pressed(true);
+                                } else if (act == 2) { // MOVE
                                     int dx = Math.round(rawX - downRawX);
                                     int dy = Math.round(rawY - downRawY);
-                                    if (!dragging && (Math.abs(dx) > 10 || Math.abs(dy) > 10)) {
-                                        dragging = true;
+                                    if (draggable) {
+                                        if (!dragging && (Math.abs(dx) > slop || Math.abs(dy) > slop)) {
+                                            dragging = true;
+                                            pressed(false);
+                                        }
+                                        if (dragging) {
+                                            updateWindowPositionOnUiThread(startX + dx, startY + dy);
+                                        }
+                                    } else if (!canceled && (Math.abs(dx) > cancelSlop || Math.abs(dy) > cancelSlop)) {
+                                        canceled = true;
+                                        pressed(false);
                                     }
-                                    if (dragging) {
-                                        updateWindowPositionOnUiThread(startX + dx, startY + dy);
-                                    }
-                                } else if (act == 1 || act == 3) {
-                                    if (!dragging && act == 1 && clickAction != null) {
+                                } else if (act == 1) { // UP
+                                    pressed(false);
+                                    if (!dragging && !canceled && clickAction != null) {
                                         clickAction.run();
                                     }
                                     dragging = false;
+                                } else if (act == 3) { // CANCEL
+                                    pressed(false);
+                                    dragging = false;
+                                    canceled = true;
                                 }
                             } catch (Throwable ignored) {
                             }
@@ -1279,43 +1869,6 @@ public final class AuxMonOverlay {
                         return Boolean.TRUE;
                     }
                 });
-        viewCls.getMethod("setOnTouchListener", touchListenerCls).invoke(view, proxy);
-    }
-
-    private static void disableViewEffects(Object view) {
-        try {
-            Class<?> viewCls = Class.forName("android.view.View");
-            viewCls.getMethod("setSoundEffectsEnabled", boolean.class).invoke(view, false);
-            viewCls.getMethod("setHapticFeedbackEnabled", boolean.class).invoke(view, false);
-        } catch (Throwable ignored) {
-        }
-    }
-
-    private static void setTextViewStyle(Object tv, String text, float sizeSp, int color, boolean bold) throws Exception {
-        Class<?> tvCls = Class.forName("android.widget.TextView");
-        tvCls.getMethod("setText", CharSequence.class).invoke(tv, text);
-        tvCls.getMethod("setTextSize", int.class, float.class).invoke(tv, 2, sizeSp);
-        tvCls.getMethod("setTextColor", int.class).invoke(tv, color);
-        if (bold) {
-            Class<?> tfCls = Class.forName("android.graphics.Typeface");
-            Object defaultBold = tfCls.getField("DEFAULT_BOLD").get(null);
-            tvCls.getMethod("setTypeface", tfCls, int.class).invoke(tv, defaultBold, 1);
-        }
-    }
-
-    private static void setRoundedBg(Object view, int fillColor, int strokeColor, int strokeWidthPx, float radiusPx) throws Exception {
-        Class<?> gdCls = Class.forName("android.graphics.drawable.GradientDrawable");
-        Class<?> drawableCls = Class.forName("android.graphics.drawable.Drawable");
-        Class<?> viewCls = Class.forName("android.view.View");
-        Object gd = gdCls.getConstructor().newInstance();
-        gdCls.getMethod("setColor", int.class).invoke(gd, fillColor);
-        gdCls.getMethod("setCornerRadius", float.class).invoke(gd, radiusPx);
-        gdCls.getMethod("setStroke", int.class, int.class).invoke(gd, strokeWidthPx, strokeColor);
-        viewCls.getMethod("setBackgroundDrawable", drawableCls).invoke(view, gd);
-    }
-
-    private static void setMargins(Object marginLp, int l, int t, int r, int b) throws Exception {
-        Class<?> mlpCls = Class.forName("android.view.ViewGroup$MarginLayoutParams");
-        mlpCls.getMethod("setMargins", int.class, int.class, int.class, int.class).invoke(marginLp, l, t, r, b);
+        cView.getMethod("setOnTouchListener", touchListenerCls).invoke(view, proxy);
     }
 }

@@ -30,7 +30,7 @@ import java.util.Locale;
  */
 public class AuxMonMain {
 
-    public static final String VERSION = "1.4.1";
+    public static final String VERSION = "1.5.0";
     private static final String CMD_FILE_PATH = "/data/local/tmp/hkg_auxmon_cmd";
     private static final String STATE_JSON_PATH = "/data/local/tmp/hkg_auxmon_state.json";
     private static final String CONFIG_FILE_PATH = "/data/local/tmp/hkg_auxmon/config.txt";
@@ -232,7 +232,8 @@ public class AuxMonMain {
                                             + "회, 경과 " + AuxMonModels.formatDurationHms(activeParkingSession.getElapsedParkingSec())
                                             + ")이 저장되었습니다.",
                                     0xFF10B981);
-                            AuxMonOverlay.showOverlay();
+                            // Driving: show only the small pill so the panel never covers navigation
+                            AuxMonOverlay.showOverlayCompact();
                         }
                     } else if (!wasShutdownState && isShutdownNow
                             && activeParkingSession != null
@@ -615,8 +616,8 @@ public class AuxMonMain {
             displayedSessionIdx = sessionHistory.size() - 1;
             saveSessionQuietly(demo);
             setStatusBanner(
-                    "🧪 시뮬레이션 데이터(자동충전 " + demo.getChargeCount()
-                            + "회, 샘플 " + demo.samples.size() + "건) 생성 완료! [데이터 내보내기]로 USB 저장을 테스트해보세요.",
+                    "📋 시뮬레이션 데이터(자동충전 " + demo.getChargeCount()
+                            + "회, 샘플 " + demo.samples.size() + "건) 생성 완료! [충전 기록] 탭에서 화면과 USB 저장을 확인해 보세요.",
                     0xFFC7D2FE);
         }
     }
@@ -678,8 +679,36 @@ public class AuxMonMain {
             activeParkingSession.targetParkingHours = normalized;
         }
         saveConfigToDisk();
-        setStatusBanner("⏱ 시동 종료 후 절전 유지(PwrKeep) 목표 시간이 ["
+        setStatusBanner("🕒 시동 종료 후 절전 유지(PwrKeep) 목표 시간이 ["
                 + AuxMonModels.formatTargetHoursLabel(normalized) + "]으로 설정되었습니다.", 0xFF38BDF8);
+    }
+
+    /** Settings tab: pick a target keep duration directly (0 = 상시). */
+    public static void setTargetParkingHoursFromUi(int hours) {
+        synchronized (STATE_LOCK) {
+            setTargetParkingHours(hours);
+        }
+    }
+
+    /** Settings tab: pick a sampling interval directly (10 / 30 / 60 s). */
+    public static void setSampleIntervalSecFromUi(int sec) {
+        if (sec != 10 && sec != 30 && sec != 60) return;
+        synchronized (STATE_LOCK) {
+            if (configuredSampleIntervalSec == sec) return;
+            configuredSampleIntervalSec = sec;
+            saveConfigToDisk();
+            setStatusBanner("🕒 주차 중 기록 간격을 [" + sec + "초]로 바꿨습니다.", 0xFF38BDF8);
+        }
+    }
+
+    /** Settings tab: pick the auto-charge mode directly (no-op if it is already selected). */
+    public static void setAutoChargeModeFromUi(int mode) {
+        if (mode != AuxMonModels.MODE_PASSIVE_OBSERVE && mode != AuxMonModels.MODE_ACTIVE_1H_IG3) return;
+        synchronized (STATE_LOCK) {
+            if (configuredAutoChargeMode != mode) {
+                toggleAutoChargeMode();
+            }
+        }
     }
 
     public static void cycleSampleIntervalSec() {
@@ -694,7 +723,7 @@ public class AuxMonMain {
             }
             configuredSampleIntervalSec = next;
             saveConfigToDisk();
-            setStatusBanner("⏱ 주차 중 샘플링 및 폴링 주기가 [" + next + "초]로 설정되었습니다.", 0xFF38BDF8);
+            setStatusBanner("🕒 주차 중 샘플링 및 폴링 주기가 [" + next + "초]로 설정되었습니다.", 0xFF38BDF8);
         }
     }
 
@@ -749,6 +778,10 @@ public class AuxMonMain {
 
     public static LiveTelemetrySnapshot getLatestLiveSnapshot() {
         return latestLiveSnapshot;
+    }
+
+    public static ParkingSession getActiveParkingSession() {
+        return activeParkingSession;
     }
 
     public static boolean isCurrentlyMonitoringParking() {
