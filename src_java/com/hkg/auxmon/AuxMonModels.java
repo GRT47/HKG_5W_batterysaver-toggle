@@ -124,10 +124,13 @@ public final class AuxMonModels {
         /**
          * Determines whether 12V auxiliary battery charging (IG3 / LDC) is currently active.
          * Uses authoritative HEV/DATC ig3On status or direct measured voltage rise (>= 13.55V).
-         * Does NOT use getIG3RlyMode() (VCU10_CF_Vcu_IG3RlyMd) directly for charging detection
-         * because VCU reports values such as 2 in normal non-charging states.
+         * Excludes OEM telematics remote climate/control sessions (teleAccStatus == 2 while powerStatus != 0)
+         * and does NOT use getIG3RlyMode() (VCU10_CF_Vcu_IG3RlyMd) directly for charging detection.
          */
         public boolean isChargingActive() {
+            if (powerStatus != 0 && teleAccStatus == 2) {
+                return false;
+            }
             if (ig3On) return true;
             if (!ignOn && !accOn && isDirectVoltageMeasured() && voltageV >= 13.55f) return true;
             return false;

@@ -40,26 +40,49 @@ is_java_pid_alive() {
     return 1
 }
 
-# Acquire atomic directory lock around SVC_PID_FILE check-and-write to prevent race with post.sh / NEMESIS
+# Acquire atomic directory lock with owner PID tracking to clean up stale locks after power loss
 lock_acquired=0
-for _lk in 1 2 3 4 5; do
-    if mkdir "$SVC_LOCK_DIR" 2>/dev/null; then
-        lock_acquired=1
-        break
+acquire_svc_lock() {
+    lock_acquired=0
+    for _lk in 1 2 3 4 5; do
+        if mkdir "$SVC_LOCK_DIR" 2>/dev/null; then
+            echo "$$" > "$SVC_LOCK_DIR/pid" 2>/dev/null
+            lock_acquired=1
+            return 0
+        fi
+        lock_owner="$(cat "$SVC_LOCK_DIR/pid" 2>/dev/null)"
+        if [ -z "$lock_owner" ] || ! is_svc_pid_alive "$lock_owner"; then
+            rm -rf "$SVC_LOCK_DIR" 2>/dev/null
+            if mkdir "$SVC_LOCK_DIR" 2>/dev/null; then
+                echo "$$" > "$SVC_LOCK_DIR/pid" 2>/dev/null
+                lock_acquired=1
+                return 0
+            fi
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+release_svc_lock() {
+    if [ "$lock_acquired" = "1" ]; then
+        rm -rf "$SVC_LOCK_DIR" 2>/dev/null
+        lock_acquired=0
     fi
-    sleep 1
-done
+}
+
+acquire_svc_lock
 
 if [ -f "$SVC_PID_FILE" ]; then
     old_svc_pid="$(cat "$SVC_PID_FILE" 2>/dev/null)"
     if [ -n "$old_svc_pid" ] && [ "$old_svc_pid" != "$$" ] && is_svc_pid_alive "$old_svc_pid"; then
-        [ "$lock_acquired" = "1" ] && rmdir "$SVC_LOCK_DIR" 2>/dev/null
+        release_svc_lock
         exit 0
     fi
 fi
 rm -f "$STOP_FLAG" 2>/dev/null
 echo "$$" > "$SVC_PID_FILE" 2>/dev/null
-[ "$lock_acquired" = "1" ] && rmdir "$SVC_LOCK_DIR" 2>/dev/null
+release_svc_lock
 
 log_info() {
     echo "[AuxMon] $*"
@@ -120,9 +143,24 @@ start_mon_java() {
 }
 
 on_stop() {
-    log_info "Service stopping via signal; releasing PwrKeep & IG3..."
-    release_power_keep_safely
-    rm -f "$SVC_PID_FILE" "$JAVA_PID_FILE" "$STOP_FLAG" 2>/dev/null
+    stop_mode="$(cat "$STOP_FLAG" 2>/dev/null)"
+    saved_mon_pid="$MON_PID"
+    if [ "$stop_mode" = "update" ]; then
+        log_info "Service stopping for package update handover; preserving PwrKeep state for new daemon..."
+        kill_mon_java
+    else
+        log_info "Service stopping via signal; releasing PwrKeep & IG3..."
+        release_power_keep_safely
+    fi
+    if [ -f "$SVC_PID_FILE" ] && [ "$(cat "$SVC_PID_FILE" 2>/dev/null)" = "$$" ]; then
+        rm -f "$SVC_PID_FILE" 2>/dev/null
+    fi
+    if [ -n "$saved_mon_pid" ] && [ -f "$JAVA_PID_FILE" ] && [ "$(cat "$JAVA_PID_FILE" 2>/dev/null)" = "$saved_mon_pid" ]; then
+        rm -f "$JAVA_PID_FILE" 2>/dev/null
+    fi
+    if [ "$stop_mode" != "update" ]; then
+        rm -f "$STOP_FLAG" 2>/dev/null
+    fi
     exit 0
 }
 trap 'on_stop' TERM INT

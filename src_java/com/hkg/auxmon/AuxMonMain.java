@@ -30,7 +30,7 @@ import java.util.Locale;
  */
 public class AuxMonMain {
 
-    public static final String VERSION = "1.3.0";
+    public static final String VERSION = "1.4.0";
     private static final String CMD_FILE_PATH = "/data/local/tmp/hkg_auxmon_cmd";
     private static final String STATE_JSON_PATH = "/data/local/tmp/hkg_auxmon_state.json";
     private static final String CONFIG_FILE_PATH = "/data/local/tmp/hkg_auxmon/config.txt";
@@ -215,8 +215,10 @@ public class AuxMonMain {
                                 isShutdownNow);
                         lastSampleRt = nowRt;
                     } else if (!wasDriving && isDrivingNow) {
-                        // Vehicle started driving again -> Clear latches, finalize ongoing parking session & restore screen
-                        HkmcVehicleBridge.resetSafetyCutoff();
+                        // Vehicle started driving again -> Clear latches (only on actual ACCON=0), finalize ongoing parking session & restore screen
+                        if (snap.powerStatus == 0) {
+                            HkmcVehicleBridge.resetSafetyCutoff();
+                        }
                         HkmcVehicleBridge.setScreenSleepMode(false);
                         if (activeParkingSession != null && activeParkingSession.status == AuxMonModels.SESSION_MONITORING_PARKING) {
                             activeParkingSession.closeOngoingChargeIfAny(nowEpochMs);
@@ -238,6 +240,9 @@ public class AuxMonMain {
                         // Session started in LOGICON(1)/ADM(2)/TELE_ACC_OFF and now entered DELAYMODE(6)/PRESYSTEMOFF(7)
                         AuxMonOverlay.hideOverlay();
                         HkmcVehicleBridge.setScreenSleepMode(true);
+                    } else if (wasShutdownState && !isShutdownNow) {
+                        // Transitioned from DELAYMODE(6)/PRESYSTEMOFF(7) back to LOGICON(1)/ADM(2) -> restore LCD screen
+                        HkmcVehicleBridge.setScreenSleepMode(false);
                     }
                     wasDriving = isDrivingNow;
                     wasShutdownState = isShutdownNow;
@@ -952,6 +957,15 @@ public class AuxMonMain {
             snapLogicon.ignOn = true;
             assertTrue(!snapLogicon.isDrivingState(), "LOGICON(1) must be NOT driving");
             assertTrue(!snapLogicon.isShutdownPowerState(), "LOGICON(1) must NOT turn off screen (isShutdownPowerState=false)");
+
+            LiveTelemetrySnapshot snapRemoteClimate = new LiveTelemetrySnapshot();
+            snapRemoteClimate.powerStatus = 6; // DELAYMODE (parked)
+            snapRemoteClimate.teleAccStatus = 2; // TeleAcc ON for remote climate
+            snapRemoteClimate.accOn = false;
+            snapRemoteClimate.ignOn = false;
+            snapRemoteClimate.ig3On = true; // IG3 turned on by remote climate
+            assertTrue(!snapRemoteClimate.isDrivingState(), "Remote climate (powerStatus=6, teleAccStatus=2) must NOT be treated as driving");
+            assertTrue(!snapRemoteClimate.isChargingActive(), "Remote climate (teleAccStatus=2 while parked) must NOT be counted as Aux. Battery Saver+ charging");
 
             // 3. Test Safety Cutoff Rules & Conditional IG3 OFF
             LiveTelemetrySnapshot snapUnnormal = new LiveTelemetrySnapshot();

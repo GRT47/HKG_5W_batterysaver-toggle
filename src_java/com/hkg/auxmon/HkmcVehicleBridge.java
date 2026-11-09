@@ -278,8 +278,8 @@ public final class HkmcVehicleBridge {
         if (pwrSt < 0) {
             pwrSt = 0;
         }
-        // ACCON (0) is checked FIRST and clears any stale TeleAcc ACCOFF(1) left from earlier remote/parking
-        if (pwrSt == 0 && cachedTeleAccStatus == 1) {
+        // ACCON (0) is checked FIRST and clears any stale TeleAcc value left from earlier remote/parking
+        if (pwrSt == 0 && cachedTeleAccStatus != -1) {
             cachedTeleAccStatus = -1;
         }
         snap.powerStatus = pwrSt;
@@ -293,9 +293,8 @@ public final class HkmcVehicleBridge {
             acc = true;
         } else {
             boolean nonDrivingMicom = (pwrSt == 1 || pwrSt == 2 || pwrSt == 6 || pwrSt == 7 || pwrSt == 255)
-                    || (cachedTeleAccStatus == 1);
+                    || (cachedTeleAccStatus == 1) || (cachedTeleAccStatus == 2);
             if (!nonDrivingMicom) {
-                acc = (cachedTeleAccStatus == 2);
                 if (bcmMgr != null) {
                     try {
                         Object ignVal = bcmMgr.getClass().getMethod("getIGNStatus").invoke(bcmMgr);
@@ -718,12 +717,20 @@ public final class HkmcVehicleBridge {
                         public void onPowerStatusChanged(int status) {
                             cachedPowerStatus = status;
                             if (status == 0) {
-                                // ACCON: vehicle is running again -> clear stale TeleAcc cache, safety cutoff & re-enable auto keep
+                                // ACCON: vehicle is running again -> clear stale TeleAcc cache, safety cutoff, re-enable auto keep & restore LCD
                                 cachedTeleAccStatus = -1;
                                 resetSafetyCutoff();
-                            } else if ((status == 1 || status == 2 || status == 6 || status == 7)
+                                setScreenSleepMode(false);
+                            } else if (status == 1 || status == 2) {
+                                // LOGICON(1) / ADM(2): user turned on headunit while parked -> restore LCD screen if it was asleep
+                                setScreenSleepMode(false);
+                                if (autoKeepOnShutdownEnabled && !safetyCutoffTripped) {
+                                    sendPwrKeepStartImmediate("onPowerStatusChanged:" + status);
+                                    notifyAccOffIntercepted("POWER_STATUS_" + status);
+                                }
+                            } else if ((status == 6 || status == 7)
                                     && autoKeepOnShutdownEnabled && !safetyCutoffTripped) {
-                                // Immediately assert PwrKeep(2) on LOGICON / ADM / DELAYMODE / PRESYSTEMOFF
+                                // Immediately assert PwrKeep(2) on DELAYMODE(6) / PRESYSTEMOFF(7)
                                 sendPwrKeepStartImmediate("onPowerStatusChanged:" + status);
                                 notifyAccOffIntercepted("POWER_STATUS_" + status);
                             }
@@ -733,10 +740,9 @@ public final class HkmcVehicleBridge {
                         @Override
                         public void onTeleAccStatusChanged(int status) {
                             cachedTeleAccStatus = status;
-                            if (status == 2) {
-                                // TeleAcc ACCON -> clear safety cutoff & re-enable auto keep
-                                resetSafetyCutoff();
-                            } else if (status == 1 && cachedPowerStatus != 0 && autoKeepOnShutdownEnabled && !safetyCutoffTripped) {
+                            // Do NOT call resetSafetyCutoff() on status == 2 (remote climate/start);
+                            // safety cutoff latch must only be cleared by actual ignition ON (powerStatus == 0) or manual user start.
+                            if (status == 1 && cachedPowerStatus != 0 && autoKeepOnShutdownEnabled && !safetyCutoffTripped) {
                                 // TeleAcc ACCOFF (when not in ACCON): immediately assert PwrKeep(2) before Micom starts shutdown
                                 sendPwrKeepStartImmediate("onTeleAccStatusChanged:ACCOFF");
                                 notifyAccOffIntercepted("TELE_ACC_OFF");
